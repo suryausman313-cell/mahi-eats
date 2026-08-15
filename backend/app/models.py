@@ -29,6 +29,7 @@ class Shop(Base):
     is_open: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     admins = relationship("ShopAdmin", back_populates="shop", cascade="all, delete-orphan")
+    delivery_rule = relationship("ShopDeliveryRule", back_populates="shop", uselist=False, cascade="all, delete-orphan")
 
 
 class ShopAdmin(Base):
@@ -120,6 +121,7 @@ class Order(Base):
     items = relationship("OrderItem", back_populates="order", cascade="all, delete-orphan")
     rider = relationship("Rider")
     shop = relationship("Shop")
+    delivery_meta = relationship("OrderDeliveryMeta", back_populates="order", uselist=False, cascade="all, delete-orphan")
 
 
 class OrderItem(Base):
@@ -132,3 +134,45 @@ class OrderItem(Base):
     unit_price: Mapped[float] = mapped_column(Float)
     line_total: Mapped[float] = mapped_column(Float)
     order = relationship("Order", back_populates="items")
+
+
+class CustomerAccount(Base):
+    __tablename__ = "customer_accounts"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(120), nullable=False)
+    phone: Mapped[str] = mapped_column(String(40), unique=True, index=True, nullable=False)
+    pin_hash: Mapped[str] = mapped_column(Text, nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    failed_attempts: Mapped[int] = mapped_column(Integer, default=0)
+    locked_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    last_login_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class ShopDeliveryRule(Base):
+    __tablename__ = "shop_delivery_rules"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    shop_id: Mapped[int] = mapped_column(ForeignKey("shops.id", ondelete="CASCADE"), unique=True, index=True, nullable=False)
+    area_note: Mapped[str | None] = mapped_column(String(240), nullable=True)
+    base_fee: Mapped[float] = mapped_column(Float, default=0)
+    free_km: Mapped[float] = mapped_column(Float, default=0)
+    per_km_fee: Mapped[float] = mapped_column(Float, default=0)
+    max_delivery_km: Mapped[float] = mapped_column(Float, default=0)
+    max_fee: Mapped[float] = mapped_column(Float, default=0)
+    is_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    shop = relationship("Shop", back_populates="delivery_rule")
+
+
+class OrderDeliveryMeta(Base):
+    __tablename__ = "order_delivery_meta"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    order_id: Mapped[int] = mapped_column(ForeignKey("orders.id", ondelete="CASCADE"), unique=True, index=True, nullable=False)
+    distance_km: Mapped[float | None] = mapped_column(Float, nullable=True)
+    duration_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    distance_source: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    base_fee: Mapped[float] = mapped_column(Float, default=0)
+    free_km: Mapped[float] = mapped_column(Float, default=0)
+    per_km_fee: Mapped[float] = mapped_column(Float, default=0)
+    calculated_fee: Mapped[float] = mapped_column(Float, default=0)
+    order = relationship("Order", back_populates="delivery_meta")

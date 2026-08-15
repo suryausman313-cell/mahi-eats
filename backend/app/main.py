@@ -1,16 +1,25 @@
+import json
 import math
 import os
+import re
+import urllib.error
+import urllib.request
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, selectinload
 
 from .database import Base, engine, get_db
-from .models import Category, Order, OrderItem, Product, Rider, Shop, ShopAdmin
+from .models import Category, CustomerAccount, Order, OrderDeliveryMeta, OrderItem, Product, Rider, Shop, ShopAdmin, ShopDeliveryRule
 from .schemas import (
     AdminCreate,
+    CustomerLoginIn,
+    CustomerRegisterIn,
+    DeliveryQuoteIn,
+    DeliveryRuleIn,
     AssignRiderIn,
     CategoryIn,
     KitchenLoginIn,
@@ -34,6 +43,7 @@ from .security import (
     bearer_payload,
     hash_password,
     issue_token,
+    require_customer,
     require_kitchen,
     require_rider,
     require_shop,
@@ -48,7 +58,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="Mahi Eats API", version="2.0.0", lifespan=lifespan)
+app = FastAPI(title="Mahi Eats API", version="4.0.0", lifespan=lifespan)
 origins = [x.strip() for x in os.getenv("CORS_ORIGINS", "http://localhost:5173").split(",") if x.strip()]
 app.add_middleware(
     CORSMiddleware,
@@ -57,6 +67,121 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+GOOGLE_MAPS_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY", "").strip()
+
+
+def normalize_phone(value: str) -> str:
+    raw = re.sub(r"[^0-9+]", "", (value or "").strip())
+    if raw.startswith("00"):
+        raw = "+" + raw[2:]
+    if raw.startswith("971"):
+        raw = "+" + raw
+    if raw.startswith("05") and len(raw) == 10:
+        raw = "+971" + raw[1:]
+    return raw
+
+
+def customer_json(c: CustomerAccount):
+    return {"id": c.id, "name": c.name, "phone": c.phone}
+
+
+def delivery_rule_json(rule: ShopDeliveryRule | None, shop: Shop | None = None):
+    if not rule:
+        return {
+            "area_note": None,
+            "base_fee": float(shop.delivery_fee if shop else 0),
+            "free_km": 0.0,
+            "per_km_fee": 0.0,
+            "max_delivery_km": 0.0,
+            "max_fee": 0.0,
+            "is_enabled": True,
+        }
+    return {
+        "area_note": rule.area_note,
+        "base_fee": float(rule.base_fee or 0),
+        "free_km": float(rule.free_km or 0),
+        "per_km_fee": float(rule.per_km_fee or 0),
+        "max_delivery_km": float(rule.max_delivery_km or 0),
+        "max_fee": float(rule.max_fee or 0),
+        "is_enabled": bool(rule.is_enabled),
+    }
+
+
+def get_delivery_rule(db: Session, shop: Shop) -> ShopDeliveryRule | None:
+    return db.scalar(select(ShopDeliveryRule).where(ShopDeliveryRule.shop_id == shop.id))
+
+
+def compute_road_distance(origin_lat: float, origin_lon: float, dest_lat: float, dest_lon: float):
+    if GOOGLE_MAPS_API_KEY:
+        body = json.dumps({
+            "origin": {"location": {"latLng": {"latitude": origin_lat, "longitude": origin_lon}}},
+            "destination": {"location": {"latLng": {"latitude": dest_lat, "longitude": dest_lon}}},
+            "travelMode": "DRIVE",
+            "routingPreference": "TRAFFIC_UNAWARE",
+            "computeAlternativeRoutes": False,
+            "languageCode": "en-US",
+            "units": "METRIC",
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            "https://routes.googleapis.com/directions/v2:computeRoutes",
+            data=body,
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "X-Goog-Api-Key": GOOGLE_MAPS_API_KEY,
+                "X-Goog-FieldMask": "routes.distanceMeters,routes.duration",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=10) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            route = (payload.get("routes") or [None])[0]
+            if route and route.get("distanceMeters") is not None:
+                duration_raw = str(route.get("duration") or "0s").rstrip("s")
+                try:
+                    duration_seconds = int(float(duration_raw))
+                except ValueError:
+                    duration_seconds = None
+                return round(float(route["distanceMeters"]) / 1000.0, 2), duration_seconds, "google_routes"
+        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, ValueError, KeyError):
+            pass
+    # Development fallback so the app can still be tested before a routing key is configured.
+    estimate = km_distance(origin_lat, origin_lon, dest_lat, dest_lon)
+    return (round(float(estimate), 2) if estimate is not None else None), None, "straight_line_estimate"
+
+
+def delivery_quote(db: Session, shop: Shop, latitude: float, longitude: float):
+    if shop.latitude is None or shop.longitude is None:
+        raise HTTPException(409, "Shop delivery location is not configured by Super Admin")
+    rule = get_delivery_rule(db, shop)
+    rule_data = delivery_rule_json(rule, shop)
+    distance_km, duration_seconds, source = compute_road_distance(shop.latitude, shop.longitude, latitude, longitude)
+    if distance_km is None:
+        raise HTTPException(503, "Could not calculate delivery distance")
+    max_km = float(rule_data["max_delivery_km"] or 0)
+    deliverable = not max_km or distance_km <= max_km + 1e-9
+    extra_km = max(0.0, distance_km - float(rule_data["free_km"] or 0))
+    fee = float(rule_data["base_fee"] or 0) + extra_km * float(rule_data["per_km_fee"] or 0)
+    max_fee = float(rule_data["max_fee"] or 0)
+    if max_fee > 0:
+        fee = min(fee, max_fee)
+    fee = round(fee + 1e-9, 2)
+    return {
+        "shop_id": shop.id,
+        "distance_km": distance_km,
+        "duration_seconds": duration_seconds,
+        "distance_source": source,
+        "is_road_distance": source == "google_routes",
+        "deliverable": deliverable,
+        "delivery_fee": fee,
+        "max_delivery_km": max_km,
+        "area_note": rule_data["area_note"],
+        "base_fee": float(rule_data["base_fee"] or 0),
+        "free_km": float(rule_data["free_km"] or 0),
+        "per_km_fee": float(rule_data["per_km_fee"] or 0),
+    }
 
 
 def shop_json(s: Shop):
@@ -74,6 +199,7 @@ def shop_json(s: Shop):
         "latitude": s.latitude,
         "longitude": s.longitude,
         "delivery_fee": s.delivery_fee,
+        "delivery_pricing": delivery_rule_json(getattr(s, "delivery_rule", None), s),
         "min_order": s.min_order,
         "estimated_minutes": s.estimated_minutes,
         "delivery_mode": s.delivery_mode,
@@ -120,13 +246,24 @@ def order_json(o: Order, include_items: bool = True, public: bool = False):
         "subtotal": o.subtotal,
         "delivery_fee": o.delivery_fee,
         "total": o.total,
+        "delivery_distance_km": o.delivery_meta.distance_km if getattr(o, "delivery_meta", None) else None,
+        "delivery_distance_source": o.delivery_meta.distance_source if getattr(o, "delivery_meta", None) else None,
         "created_at": o.created_at.isoformat(),
         "assigned_at": o.assigned_at.isoformat() if o.assigned_at else None,
         "picked_up_at": o.picked_up_at.isoformat() if o.picked_up_at else None,
         "delivered_at": o.delivered_at.isoformat() if o.delivered_at else None,
     }
     if o.shop:
-        data["shop"] = {"id": o.shop.id, "name": o.shop.name, "slug": o.shop.slug, "phone": o.shop.phone, "address": o.shop.address}
+        data["shop"] = {
+            "id": o.shop.id,
+            "name": o.shop.name,
+            "slug": o.shop.slug,
+            "phone": o.shop.phone,
+            "address": o.shop.address,
+            "city": o.shop.city,
+            "latitude": o.shop.latitude,
+            "longitude": o.shop.longitude,
+        }
     if o.rider:
         data["rider"] = rider_json(o.rider)
     if include_items:
@@ -177,9 +314,117 @@ def release_rider(db: Session, order: Order):
             rider.is_available = True
 
 
+def _rider_active_deliveries(db: Session, rider_id: int):
+    return int(
+        db.scalar(
+            select(func.count())
+            .select_from(Order)
+            .where(
+                Order.rider_id == rider_id,
+                Order.status.not_in(["delivered", "cancelled"]),
+                Order.rider_status != "delivered",
+            )
+        )
+        or 0
+    )
+
+
+def _gps_meta(rider: Rider):
+    if not rider.location_updated_at:
+        return {"gps_fresh": False, "location_age_seconds": None}
+    updated = rider.location_updated_at
+    if updated.tzinfo is None:
+        updated = updated.replace(tzinfo=timezone.utc)
+    age = max(0, int((datetime.now(timezone.utc) - updated).total_seconds()))
+    return {"gps_fresh": age <= 180, "location_age_seconds": age}
+
+
+def _dispatch_rider_json(db: Session, rider: Rider, shop: Shop | None = None):
+    data = rider_json(rider, private=True)
+    data.update(_gps_meta(rider))
+    data["active_deliveries"] = _rider_active_deliveries(db, rider.id)
+    data["distance_to_shop_km"] = km_distance(
+        shop.latitude if shop else None,
+        shop.longitude if shop else None,
+        rider.latitude,
+        rider.longitude,
+    )
+    # Manual dispatch is intentionally Super-Admin controlled. Offline/busy riders stay visible
+    # but cannot be selected, similar to a central fleet dispatcher view.
+    data["eligible_for_assignment"] = bool(rider.is_active and rider.is_online and rider.is_available)
+    return data
+
+
+def _uae_period_bounds():
+    now = datetime.now(ZoneInfo("Asia/Dubai"))
+    today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    week = today - timedelta(days=today.weekday())
+    month = today.replace(day=1)
+
+    def utc_naive(value):
+        return value.astimezone(timezone.utc).replace(tzinfo=None)
+
+    return {
+        "today": utc_naive(today),
+        "week": utc_naive(week),
+        "month": utc_naive(month),
+        "now": utc_naive(now),
+    }
+
+
+def _shop_period_stats(db: Session, shop: Shop, start: datetime | None = None):
+    filters = [Order.shop_id == shop.id, Order.status != "cancelled"]
+    all_filters = [Order.shop_id == shop.id]
+    if start is not None:
+        filters.append(Order.created_at >= start)
+        all_filters.append(Order.created_at >= start)
+
+    sales = float(db.scalar(select(func.coalesce(func.sum(Order.total), 0)).where(*filters)) or 0)
+    food_sales = float(db.scalar(select(func.coalesce(func.sum(Order.subtotal), 0)).where(*filters)) or 0)
+    delivery_fees = float(db.scalar(select(func.coalesce(func.sum(Order.delivery_fee), 0)).where(*filters)) or 0)
+    orders = int(db.scalar(select(func.count()).select_from(Order).where(*filters)) or 0)
+    cancelled = int(db.scalar(select(func.count()).select_from(Order).where(*all_filters, Order.status == "cancelled")) or 0)
+    pending = int(db.scalar(select(func.count()).select_from(Order).where(*all_filters, Order.status.not_in(["delivered", "cancelled"]))) or 0)
+    delivered = int(db.scalar(select(func.count()).select_from(Order).where(*all_filters, Order.status == "delivered")) or 0)
+    cash_sales = float(db.scalar(select(func.coalesce(func.sum(Order.total), 0)).where(*filters, func.lower(Order.payment_method).like("%cash%"))) or 0)
+    cash_orders = int(db.scalar(select(func.count()).select_from(Order).where(*filters, func.lower(Order.payment_method).like("%cash%"))) or 0)
+    card_sales = max(sales - cash_sales, 0.0)
+    card_orders = max(orders - cash_orders, 0)
+    commission = food_sales * float(shop.commission_percent or 0) / 100.0
+    shop_delivery_income = delivery_fees if shop.delivery_mode == "shop" else 0.0
+    shop_receivable = max(food_sales - commission + shop_delivery_income, 0.0)
+    return {
+        "orders": orders,
+        "pending": pending,
+        "delivered": delivered,
+        "cancelled": cancelled,
+        "customer_sales": sales,
+        "food_sales": food_sales,
+        "delivery_fees": delivery_fees,
+        "cash_sales": cash_sales,
+        "cash_orders": cash_orders,
+        "card_sales": card_sales,
+        "card_orders": card_orders,
+        "commission": commission,
+        "commission_percent": float(shop.commission_percent or 0),
+        "shop_receivable": shop_receivable,
+    }
+
+
+def _shop_dashboard(db: Session, shop: Shop):
+    bounds = _uae_period_bounds()
+    return {
+        "shop": shop_json(shop),
+        "today": _shop_period_stats(db, shop, bounds["today"]),
+        "week": _shop_period_stats(db, shop, bounds["week"]),
+        "month": _shop_period_stats(db, shop, bounds["month"]),
+        "all": _shop_period_stats(db, shop, None),
+    }
+
+
 @app.get("/api/health")
 def health():
-    return {"ok": True, "app": "Mahi Eats", "version": "2.0.0"}
+    return {"ok": True, "app": "Mahi Eats", "version": "4.0.0", "road_routing_ready": bool(GOOGLE_MAPS_API_KEY)}
 
 
 # ---------- AUTH ----------
@@ -217,6 +462,69 @@ def rider_login(data: LoginIn, db: Session = Depends(get_db)):
     return {"token": issue_token("rider", rider_id=rider.id), "rider": rider_json(rider, private=True)}
 
 
+@app.post("/api/customer/register")
+def customer_register(data: CustomerRegisterIn, db: Session = Depends(get_db)):
+    phone = normalize_phone(data.phone)
+    if len(re.sub(r"\D", "", phone)) < 8:
+        raise HTTPException(400, "Enter a valid mobile number")
+    if db.scalar(select(CustomerAccount).where(CustomerAccount.phone == phone)):
+        raise HTTPException(409, "This mobile number already has a Mahi Eats account")
+    customer = CustomerAccount(name=data.name.strip(), phone=phone, pin_hash=hash_password(data.pin))
+    db.add(customer)
+    db.commit()
+    db.refresh(customer)
+    return {"token": issue_token("customer", customer_id=customer.id, phone=customer.phone), "customer": customer_json(customer)}
+
+
+@app.post("/api/customer/login")
+def customer_login(data: CustomerLoginIn, db: Session = Depends(get_db)):
+    phone = normalize_phone(data.phone)
+    customer = db.scalar(select(CustomerAccount).where(CustomerAccount.phone == phone, CustomerAccount.is_active == True))
+    if not customer:
+        raise HTTPException(401, "Wrong mobile number or PIN")
+    now = datetime.utcnow()
+    if customer.locked_until and customer.locked_until > now:
+        minutes = max(1, int((customer.locked_until - now).total_seconds() // 60) + 1)
+        raise HTTPException(429, f"Too many wrong PIN attempts. Try again in {minutes} minute(s)")
+    if not verify_password(data.pin, customer.pin_hash):
+        customer.failed_attempts = int(customer.failed_attempts or 0) + 1
+        if customer.failed_attempts >= 5:
+            customer.failed_attempts = 0
+            customer.locked_until = now + timedelta(minutes=10)
+        db.commit()
+        raise HTTPException(401, "Wrong mobile number or PIN")
+    customer.failed_attempts = 0
+    customer.locked_until = None
+    customer.last_login_at = now
+    db.commit()
+    return {"token": issue_token("customer", customer_id=customer.id, phone=customer.phone), "customer": customer_json(customer)}
+
+
+@app.get("/api/customer/me")
+def customer_me(payload=Depends(bearer_payload), db: Session = Depends(get_db)):
+    cid = require_customer(payload)
+    customer = db.get(CustomerAccount, cid)
+    if not customer or not customer.is_active:
+        raise HTTPException(401, "Customer account is unavailable")
+    return customer_json(customer)
+
+
+@app.get("/api/customer/orders")
+def customer_orders(payload=Depends(bearer_payload), db: Session = Depends(get_db)):
+    cid = require_customer(payload)
+    customer = db.get(CustomerAccount, cid)
+    if not customer:
+        raise HTTPException(404, "Customer not found")
+    orders = db.scalars(
+        select(Order)
+        .options(selectinload(Order.items), selectinload(Order.rider), selectinload(Order.shop), selectinload(Order.delivery_meta))
+        .where(Order.customer_phone == customer.phone)
+        .order_by(Order.id.desc())
+        .limit(200)
+    ).all()
+    return [order_json(o, public=True) for o in orders]
+
+
 # ---------- CUSTOMER / PUBLIC ----------
 @app.get("/api/public/shops")
 def public_shops(q: str | None = Query(None), city: str | None = Query(None), db: Session = Depends(get_db)):
@@ -225,7 +533,7 @@ def public_shops(q: str | None = Query(None), city: str | None = Query(None), db
         term = f"%{q.strip()}%"
         stmt = stmt.where((Shop.name.ilike(term)) | (Shop.category.ilike(term)))
     if city:
-        stmt = stmt.where(Shop.city.ilike(city.strip()))
+        stmt = stmt.where(Shop.city.ilike(f"%{city.strip()}%"))
     shops = db.scalars(stmt.order_by(Shop.is_open.desc(), Shop.name.asc()).limit(300)).all()
     return [shop_json(s) for s in shops]
 
@@ -244,8 +552,20 @@ def public_shop(slug: str, db: Session = Depends(get_db)):
     }
 
 
+@app.post("/api/public/shops/{slug}/delivery-quote")
+def public_delivery_quote(slug: str, data: DeliveryQuoteIn, db: Session = Depends(get_db)):
+    shop = db.scalar(select(Shop).where(Shop.slug == slug, Shop.is_active == True))
+    if not shop:
+        raise HTTPException(404, "Shop not found")
+    return delivery_quote(db, shop, data.latitude, data.longitude)
+
+
 @app.post("/api/public/shops/{slug}/orders")
-def create_order(slug: str, data: OrderCreate, db: Session = Depends(get_db)):
+def create_order(slug: str, data: OrderCreate, payload=Depends(bearer_payload), db: Session = Depends(get_db)):
+    cid = require_customer(payload)
+    customer = db.get(CustomerAccount, cid)
+    if not customer or not customer.is_active:
+        raise HTTPException(401, "Customer login required")
     shop = db.scalar(select(Shop).where(Shop.slug == slug, Shop.is_active == True))
     if not shop:
         raise HTTPException(404, "Shop not found")
@@ -261,33 +581,59 @@ def create_order(slug: str, data: OrderCreate, db: Session = Depends(get_db)):
     subtotal = sum(pmap[i.product_id].price * i.qty for i in data.items)
     if subtotal < shop.min_order:
         raise HTTPException(400, f"Minimum order is AED {shop.min_order:.2f}")
+
+    rule = get_delivery_rule(db, shop)
+    rule_data = delivery_rule_json(rule, shop)
+    dynamic_delivery = bool(float(rule_data["per_km_fee"] or 0) > 0 or float(rule_data["max_delivery_km"] or 0) > 0 or float(rule_data["free_km"] or 0) > 0)
+    quote = None
+    if dynamic_delivery:
+        if data.customer_latitude is None or data.customer_longitude is None:
+            raise HTTPException(400, "Add your delivery location to calculate road distance and delivery fee")
+        quote = delivery_quote(db, shop, data.customer_latitude, data.customer_longitude)
+        if not quote["deliverable"]:
+            raise HTTPException(409, f"This shop delivers up to {quote['max_delivery_km']:.1f} km by road")
+        delivery_fee = float(quote["delivery_fee"])
+    else:
+        delivery_fee = float(rule_data["base_fee"] if rule else shop.delivery_fee or 0)
+
     order = Order(
         shop_id=shop.id,
-        customer_name=data.customer_name,
-        customer_phone=data.customer_phone,
+        customer_name=customer.name,
+        customer_phone=customer.phone,
         delivery_address=data.delivery_address,
         customer_latitude=data.customer_latitude,
         customer_longitude=data.customer_longitude,
         payment_method=data.payment_method,
         delivery_mode=shop.delivery_mode,
         subtotal=subtotal,
-        delivery_fee=shop.delivery_fee,
-        total=subtotal + shop.delivery_fee,
+        delivery_fee=delivery_fee,
+        total=subtotal + delivery_fee,
     )
     db.add(order)
     db.flush()
     for line in data.items:
         p = pmap[line.product_id]
         db.add(OrderItem(order_id=order.id, product_id=p.id, name=p.name, qty=line.qty, unit_price=p.price, line_total=p.price * line.qty))
+    if quote:
+        db.add(OrderDeliveryMeta(
+            order_id=order.id,
+            distance_km=quote["distance_km"],
+            duration_seconds=quote["duration_seconds"],
+            distance_source=quote["distance_source"],
+            base_fee=quote["base_fee"],
+            free_km=quote["free_km"],
+            per_km_fee=quote["per_km_fee"],
+            calculated_fee=delivery_fee,
+        ))
     db.commit()
-    return {"order_id": order.id, "total": order.total, "status": order.status, "tracking_phone": order.customer_phone}
+    return {"order_id": order.id, "total": order.total, "status": order.status, "tracking_phone": order.customer_phone, "delivery_fee": delivery_fee, "delivery_quote": quote}
 
 
 @app.get("/api/public/orders/{order_id}")
 def public_order_tracking(order_id: int, phone: str = Query(...), db: Session = Depends(get_db)):
     order = db.scalar(
         select(Order)
-        .options(selectinload(Order.items), selectinload(Order.rider), selectinload(Order.shop))
+        .options(selectinload(Order.items), selectinload(Order.rider), selectinload(Order.shop), selectinload(Order.delivery_meta))
         .where(Order.id == order_id, Order.customer_phone == phone.strip())
     )
     if not order:
@@ -315,8 +661,16 @@ def super_stats(payload=Depends(bearer_payload), db: Session = Depends(get_db)):
         "riders": db.scalar(select(func.count()).select_from(Rider).where(Rider.is_active == True)) or 0,
         "online_riders": db.scalar(select(func.count()).select_from(Rider).where(Rider.is_active == True, Rider.is_online == True)) or 0,
         "orders": db.scalar(select(func.count()).select_from(Order)) or 0,
+        "waiting_rider": db.scalar(
+            select(func.count()).select_from(Order).where(
+                Order.delivery_mode == "mahi_eats",
+                Order.rider_id.is_(None),
+                Order.status.not_in(["delivered", "cancelled"]),
+            )
+        ) or 0,
         "sales": total_sales,
         "commission": commission,
+        "road_routing_ready": bool(GOOGLE_MAPS_API_KEY),
     }
 
 
@@ -356,6 +710,34 @@ def edit_shop(shop_id: int, data: ShopUpdate, payload=Depends(bearer_payload), d
     return shop_json(shop)
 
 
+@app.get("/api/super/shops/{shop_id}/delivery-rule")
+def get_super_delivery_rule(shop_id: int, payload=Depends(bearer_payload), db: Session = Depends(get_db)):
+    require_super(payload)
+    shop = db.get(Shop, shop_id)
+    if not shop:
+        raise HTTPException(404, "Shop not found")
+    return {**delivery_rule_json(get_delivery_rule(db, shop), shop), "shop_id": shop.id, "shop_latitude": shop.latitude, "shop_longitude": shop.longitude, "road_routing_ready": bool(GOOGLE_MAPS_API_KEY)}
+
+
+@app.put("/api/super/shops/{shop_id}/delivery-rule")
+def set_super_delivery_rule(shop_id: int, data: DeliveryRuleIn, payload=Depends(bearer_payload), db: Session = Depends(get_db)):
+    require_super(payload)
+    shop = db.get(Shop, shop_id)
+    if not shop:
+        raise HTTPException(404, "Shop not found")
+    rule = get_delivery_rule(db, shop)
+    if not rule:
+        rule = ShopDeliveryRule(shop_id=shop.id)
+        db.add(rule)
+    for key, value in data.model_dump().items():
+        setattr(rule, key, value)
+    # Keep the legacy flat fee field aligned with the base fee for older clients/cards.
+    shop.delivery_fee = float(data.base_fee or 0)
+    db.commit()
+    db.refresh(rule)
+    return {**delivery_rule_json(rule, shop), "shop_id": shop.id, "road_routing_ready": bool(GOOGLE_MAPS_API_KEY)}
+
+
 @app.post("/api/super/shops/{shop_id}/admins")
 def add_admin(shop_id: int, data: AdminCreate, payload=Depends(bearer_payload), db: Session = Depends(get_db)):
     require_super(payload)
@@ -369,10 +751,88 @@ def add_admin(shop_id: int, data: AdminCreate, payload=Depends(bearer_payload), 
     return {"id": admin.id, "shop_id": shop_id, "name": admin.name, "email": admin.email}
 
 
+@app.get("/api/super/shops/{shop_id}/dashboard")
+def super_shop_dashboard(shop_id: int, payload=Depends(bearer_payload), db: Session = Depends(get_db)):
+    require_super(payload)
+    shop = db.get(Shop, shop_id)
+    if not shop:
+        raise HTTPException(404, "Shop not found")
+    data = _shop_dashboard(db, shop)
+    recent = db.scalars(
+        select(Order)
+        .options(selectinload(Order.items), selectinload(Order.rider), selectinload(Order.shop))
+        .where(Order.shop_id == shop_id)
+        .order_by(Order.id.desc())
+        .limit(20)
+    ).all()
+    data["recent_orders"] = [order_json(o) for o in recent]
+    return data
+
+
+@app.get("/api/super/dispatch")
+def super_dispatch(payload=Depends(bearer_payload), db: Session = Depends(get_db)):
+    require_super(payload)
+    waiting = db.scalars(
+        select(Order)
+        .options(selectinload(Order.items), selectinload(Order.rider), selectinload(Order.shop))
+        .where(
+            Order.delivery_mode == "mahi_eats",
+            Order.rider_id.is_(None),
+            Order.status.not_in(["delivered", "cancelled"]),
+        )
+        .order_by(Order.created_at.asc())
+        .limit(200)
+    ).all()
+    assigned = db.scalars(
+        select(Order)
+        .options(selectinload(Order.items), selectinload(Order.rider), selectinload(Order.shop))
+        .where(
+            Order.delivery_mode == "mahi_eats",
+            Order.rider_id.is_not(None),
+            Order.status.not_in(["delivered", "cancelled"]),
+            Order.rider_status != "delivered",
+        )
+        .order_by(Order.assigned_at.desc(), Order.id.desc())
+        .limit(100)
+    ).all()
+    now = datetime.utcnow()
+    def row(order: Order):
+        item = order_json(order)
+        item["waiting_minutes"] = max(0, int((now - order.created_at).total_seconds() // 60))
+        item["dispatch_priority"] = 0 if order.status == "ready" else 1 if order.status == "preparing" else 2
+        return item
+    return {
+        "waiting": sorted([row(o) for o in waiting], key=lambda x: (x["dispatch_priority"], -x["waiting_minutes"], x["id"])),
+        "assigned": [row(o) for o in assigned],
+    }
+
+
+@app.get("/api/super/orders/{order_id}/rider-candidates")
+def super_rider_candidates(order_id: int, payload=Depends(bearer_payload), db: Session = Depends(get_db)):
+    require_super(payload)
+    order = db.scalar(select(Order).options(selectinload(Order.shop)).where(Order.id == order_id))
+    if not order:
+        raise HTTPException(404, "Order not found")
+    if order.delivery_mode != "mahi_eats":
+        raise HTTPException(409, "This shop uses its own delivery")
+    riders = db.scalars(select(Rider).where(Rider.is_active == True).order_by(Rider.name.asc())).all()
+    result = [_dispatch_rider_json(db, r, order.shop) for r in riders]
+    result.sort(
+        key=lambda r: (
+            0 if r["eligible_for_assignment"] else 1,
+            0 if r["gps_fresh"] else 1,
+            999999 if r["distance_to_shop_km"] is None else r["distance_to_shop_km"],
+            r["active_deliveries"],
+            r["name"].lower(),
+        )
+    )
+    return result
+
+
 @app.get("/api/super/riders")
 def super_riders(payload=Depends(bearer_payload), db: Session = Depends(get_db)):
     require_super(payload)
-    return [rider_json(r, private=True) for r in db.scalars(select(Rider).order_by(Rider.id.desc())).all()]
+    return [_dispatch_rider_json(db, r) for r in db.scalars(select(Rider).order_by(Rider.id.desc())).all()]
 
 
 @app.post("/api/super/riders")
@@ -420,6 +880,10 @@ def super_assign_rider(order_id: int, data: AssignRiderIn, payload=Depends(beare
         raise HTTPException(404, "Rider not found")
     if order.delivery_mode != "mahi_eats":
         raise HTTPException(409, "This shop uses its own delivery")
+    if order.status in {"delivered", "cancelled"}:
+        raise HTTPException(409, "This order is already closed")
+    if order.rider_id != rider.id and (not rider.is_online or not rider.is_available):
+        raise HTTPException(409, "Select an online and available rider")
     if order.rider_id and order.rider_id != rider.id:
         old = db.get(Rider, order.rider_id)
         if old:
@@ -447,8 +911,9 @@ def shop_settings(data: ShopSettingsIn, payload=Depends(bearer_payload), db: Ses
     sid = require_shop(payload)
     shop = db.get(Shop, sid)
     updates = data.model_dump(exclude_unset=True)
-    if "delivery_mode" in updates and updates["delivery_mode"] not in {"mahi_eats", "shop"}:
-        raise HTTPException(400, "Invalid delivery mode")
+    protected = {"delivery_mode", "delivery_fee", "latitude", "longitude"}
+    if protected.intersection(updates):
+        raise HTTPException(403, "Delivery mode, shop map location and delivery pricing are controlled by Mahi Eats Super Admin")
     for k, v in updates.items():
         setattr(shop, k, v)
     db.commit()
@@ -463,6 +928,42 @@ def set_kitchen_pin(data: KitchenPinIn, payload=Depends(bearer_payload), db: Ses
     shop.kitchen_pin_hash = hash_password(data.pin)
     db.commit()
     return {"ok": True, "shop_slug": shop.slug}
+
+
+@app.get("/api/shop-admin/dashboard")
+def shop_dashboard(payload=Depends(bearer_payload), db: Session = Depends(get_db)):
+    sid = require_shop(payload)
+    shop = db.get(Shop, sid)
+    if not shop:
+        raise HTTPException(404, "Shop not found")
+    data = _shop_dashboard(db, shop)
+    recent = db.scalars(
+        select(Order)
+        .options(selectinload(Order.items), selectinload(Order.rider), selectinload(Order.shop))
+        .where(Order.shop_id == sid)
+        .order_by(Order.id.desc())
+        .limit(12)
+    ).all()
+    data["recent_orders"] = [order_json(o) for o in recent]
+    return data
+
+
+@app.get("/api/shop-admin/reports")
+def shop_reports(period: str = Query("today"), payload=Depends(bearer_payload), db: Session = Depends(get_db)):
+    sid = require_shop(payload)
+    shop = db.get(Shop, sid)
+    if not shop:
+        raise HTTPException(404, "Shop not found")
+    bounds = _uae_period_bounds()
+    if period not in {"today", "week", "month", "all"}:
+        raise HTTPException(400, "period must be today, week, month or all")
+    start = None if period == "all" else bounds[period]
+    stats = _shop_period_stats(db, shop, start)
+    q = select(Order).options(selectinload(Order.items), selectinload(Order.rider), selectinload(Order.shop)).where(Order.shop_id == sid)
+    if start is not None:
+        q = q.where(Order.created_at >= start)
+    orders = db.scalars(q.order_by(Order.id.desc()).limit(500)).all()
+    return {"period": period, "stats": stats, "orders": [order_json(o) for o in orders]}
 
 
 @app.get("/api/shop-admin/categories")
@@ -545,12 +1046,11 @@ def admin_order_status(order_id: int, data: OrderStatusIn, payload=Depends(beare
     order = db.scalar(select(Order).where(Order.id == order_id, Order.shop_id == sid))
     if not order:
         raise HTTPException(404, "Order not found")
-    allowed = {"new", "accepted", "preparing", "ready", "cancelled", "delivered"}
-    if data.status not in allowed:
-        raise HTTPException(400, "Invalid shop order status")
+    if data.status in {"accepted", "preparing", "ready"}:
+        raise HTTPException(409, "Accept, Preparing and Ready are controlled from the Kitchen app")
+    if data.status not in {"cancelled", "delivered"}:
+        raise HTTPException(400, "Shop Admin can only cancel an order or complete shop-owned delivery")
     order.status = data.status
-    if data.status in {"accepted", "preparing", "ready"} and order.delivery_mode == "mahi_eats" and not order.rider_id:
-        auto_assign_rider(db, order)
     if data.status == "cancelled":
         release_rider(db, order)
         order.rider_status = "cancelled"
@@ -611,17 +1111,42 @@ def kitchen_orders(payload=Depends(bearer_payload), db: Session = Depends(get_db
     return [order_json(o) for o in orders]
 
 
+@app.get("/api/kitchen/history")
+def kitchen_history(day: str = Query("today"), payload=Depends(bearer_payload), db: Session = Depends(get_db)):
+    sid = require_kitchen(payload)
+    if day not in {"today", "yesterday"}:
+        raise HTTPException(400, "day must be today or yesterday")
+    bounds = _uae_period_bounds()
+    today_start = bounds["today"]
+    start = today_start if day == "today" else today_start - timedelta(days=1)
+    end = bounds["now"] if day == "today" else today_start
+    orders = db.scalars(
+        select(Order)
+        .options(selectinload(Order.items), selectinload(Order.rider), selectinload(Order.shop))
+        .where(Order.shop_id == sid, Order.created_at >= start, Order.created_at < end)
+        .order_by(Order.id.desc())
+        .limit(300)
+    ).all()
+    return [order_json(o) for o in orders]
+
+
 @app.patch("/api/kitchen/orders/{order_id}/status")
 def kitchen_status(order_id: int, data: OrderStatusIn, payload=Depends(bearer_payload), db: Session = Depends(get_db)):
     sid = require_kitchen(payload)
     order = db.scalar(select(Order).where(Order.id == order_id, Order.shop_id == sid))
     if not order:
         raise HTTPException(404, "Order not found")
-    if data.status not in {"accepted", "preparing", "ready", "cancelled"}:
-        raise HTTPException(400, "Invalid kitchen status")
+    transitions = {
+        "new": {"accepted", "cancelled"},
+        "accepted": {"preparing", "cancelled"},
+        "preparing": {"ready", "cancelled"},
+        "ready": {"cancelled"},
+    }
+    if data.status == order.status:
+        return {"id": order.id, "status": order.status, "rider_id": order.rider_id, "rider_status": order.rider_status}
+    if data.status not in transitions.get(order.status, set()):
+        raise HTTPException(409, f"Kitchen cannot change {order.status} directly to {data.status}")
     order.status = data.status
-    if data.status in {"accepted", "preparing", "ready"} and order.delivery_mode == "mahi_eats" and not order.rider_id:
-        auto_assign_rider(db, order)
     if data.status == "cancelled":
         release_rider(db, order)
         order.rider_status = "cancelled"

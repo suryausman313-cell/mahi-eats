@@ -68,3 +68,9 @@ def require_rider(payload: dict) -> int:
     if payload.get("role") != "rider" or not payload.get("rider_id"):
         raise HTTPException(status_code=403, detail="Rider login required")
     return int(payload["rider_id"])
+
+
+def require_customer(payload: dict) -> int:
+    if payload.get("role") != "customer" or not payload.get("customer_id"):
+        raise HTTPException(status_code=403, detail="Customer login required")
+    return int(payload["customer_id"])

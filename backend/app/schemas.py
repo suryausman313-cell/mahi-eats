@@ -6,6 +6,17 @@ class LoginIn(BaseModel):
     password: str
 
 
+class CustomerRegisterIn(BaseModel):
+    name: str = Field(min_length=2, max_length=120)
+    phone: str = Field(min_length=7, max_length=25)
+    pin: str = Field(pattern=r"^[0-9]{4,6}$")
+
+
+class CustomerLoginIn(BaseModel):
+    phone: str = Field(min_length=7, max_length=25)
+    pin: str = Field(pattern=r"^[0-9]{4,6}$")
+
+
 class KitchenLoginIn(BaseModel):
     shop_slug: str
     pin: str
@@ -61,6 +72,10 @@ class ShopSettingsIn(BaseModel):
     latitude: float | None = None
     longitude: float | None = None
     address: str | None = None
+    phone: str | None = None
+    description: str | None = None
+    logo_url: str | None = None
+    banner_url: str | None = None
 
 
 class KitchenPinIn(BaseModel):
@@ -104,6 +119,21 @@ class AssignRiderIn(BaseModel):
     rider_id: int
 
 
+class DeliveryRuleIn(BaseModel):
+    area_note: str | None = None
+    base_fee: float = Field(default=0, ge=0)
+    free_km: float = Field(default=0, ge=0)
+    per_km_fee: float = Field(default=0, ge=0)
+    max_delivery_km: float = Field(default=0, ge=0)
+    max_fee: float = Field(default=0, ge=0)
+    is_enabled: bool = True
+
+
+class DeliveryQuoteIn(BaseModel):
+    latitude: float
+    longitude: float
+
+
 class MerchantRiderIn(BaseModel):
     name: str
     phone: str
@@ -130,8 +160,8 @@ class OrderLineIn(BaseModel):
 
 
 class OrderCreate(BaseModel):
-    customer_name: str
-    customer_phone: str
+    customer_name: str | None = None
+    customer_phone: str | None = None
     delivery_address: str | None = None
     customer_latitude: float | None = None
     customer_longitude: float | None = None
