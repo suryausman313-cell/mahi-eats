@@ -175,6 +175,20 @@ class Rider(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
+class RiderCashSubmission(Base):
+    __tablename__ = "rider_cash_submissions"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    rider_id: Mapped[int] = mapped_column(ForeignKey("riders.id", ondelete="CASCADE"), index=True, nullable=False)
+    amount: Mapped[float] = mapped_column(Float, default=0)
+    rider_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
+    admin_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    reviewed_by: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    submitted_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    rider = relationship("Rider")
+
+
 class Order(Base):
     __tablename__ = "orders"
     __table_args__ = (

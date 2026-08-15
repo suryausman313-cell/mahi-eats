@@ -15,7 +15,7 @@ from sqlalchemy.orm import Session, selectinload
 from .database import Base, engine, get_db
 from .models import (
     ActivityLog, Category, CustomerAccount, Deal, Extra, Feedback, Offer, Order,
-    OrderDeliveryMeta, OrderItem, Product, Rider, Shop, ShopAdmin, ShopDeliveryRule, ShopNotification
+    OrderDeliveryMeta, OrderItem, Product, Rider, RiderCashSubmission, Shop, ShopAdmin, ShopDeliveryRule, ShopNotification
 )
 from .schemas import (
     AdminCreate,
@@ -39,8 +39,11 @@ from .schemas import (
     OrderCreate,
     OrderStatusIn,
     ProductIn,
+    RiderCashIn,
+    RiderCashReviewIn,
     RiderCreate,
     RiderLocationIn,
+    RiderLoginIn,
     RiderStatusIn,
     RiderUpdate,
     ShopCreate,
@@ -115,7 +118,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="Mahi Eats API", version="6.0.0", lifespan=lifespan)
+app = FastAPI(title="Mahi Eats API", version="7.0.0", lifespan=lifespan)
 origins = [x.strip() for x in os.getenv("CORS_ORIGINS", "http://localhost:5173").split(",") if x.strip()]
 app.add_middleware(
     CORSMiddleware,
@@ -649,10 +652,24 @@ def kitchen_login(data: KitchenLoginIn, db: Session = Depends(get_db)):
 
 
 @app.post("/api/rider/login")
-def rider_login(data: LoginIn, db: Session = Depends(get_db)):
-    rider = db.scalar(select(Rider).where(func.lower(Rider.email) == data.email.lower(), Rider.is_active == True))
-    if not rider or not verify_password(data.password, rider.password_hash):
-        raise HTTPException(401, "Wrong email or password")
+def rider_login(data: RiderLoginIn, db: Session = Depends(get_db)):
+    rider = None
+    secret = None
+    if data.phone and (data.pin or data.password):
+        phone = normalize_phone(data.phone)
+        rider = db.scalar(select(Rider).where(Rider.phone == phone, Rider.is_active == True))
+        # Keep old production riders working even if their phone was saved before normalization.
+        if not rider:
+            rider = db.scalar(select(Rider).where(Rider.phone == data.phone.strip(), Rider.is_active == True))
+        secret = data.pin or data.password
+    elif data.email and data.password:
+        rider = db.scalar(select(Rider).where(func.lower(Rider.email) == data.email.lower(), Rider.is_active == True))
+        secret = data.password
+    if not rider or not secret or not verify_password(secret, rider.password_hash):
+        raise HTTPException(401, "Wrong mobile number or PIN")
+    rider.is_online = True
+    db.commit()
+    db.refresh(rider)
     return {"token": issue_token("rider", rider_id=rider.id), "rider": rider_json(rider, private=True)}
 
 
@@ -1132,9 +1149,17 @@ def super_riders(payload=Depends(bearer_payload), db: Session = Depends(get_db))
 @app.post("/api/super/riders")
 def super_add_rider(data: RiderCreate, payload=Depends(bearer_payload), db: Session = Depends(get_db)):
     require_super(payload)
-    if db.scalar(select(Rider).where(func.lower(Rider.email) == data.email.lower())):
-        raise HTTPException(409, "Rider email already exists")
-    rider = Rider(name=data.name, email=data.email.lower(), phone=data.phone, photo_url=data.photo_url, password_hash=hash_password(data.password))
+    phone = normalize_phone(data.phone)
+    if db.scalar(select(Rider).where(Rider.phone == phone)):
+        raise HTTPException(409, "Rider mobile number already exists")
+    secret = data.pin or data.password
+    if not secret or len(secret) < 4:
+        raise HTTPException(400, "Set a rider PIN of at least 4 digits")
+    digits = re.sub(r"\D", "", phone) or str(int(datetime.utcnow().timestamp()))
+    email = (data.email or f"rider-{digits}@mahi.local").lower()
+    if db.scalar(select(Rider).where(func.lower(Rider.email) == email)):
+        raise HTTPException(409, "Rider account already exists")
+    rider = Rider(name=data.name, email=email, phone=phone, photo_url=data.photo_url, password_hash=hash_password(secret))
     db.add(rider)
     db.commit()
     db.refresh(rider)
@@ -1147,7 +1172,13 @@ def super_edit_rider(rider_id: int, data: RiderUpdate, payload=Depends(bearer_pa
     rider = db.get(Rider, rider_id)
     if not rider:
         raise HTTPException(404, "Rider not found")
-    for k, v in data.model_dump(exclude_unset=True).items():
+    updates = data.model_dump(exclude_unset=True)
+    pin = updates.pop("pin", None)
+    if pin:
+        rider.password_hash = hash_password(pin)
+    if "phone" in updates and updates["phone"]:
+        updates["phone"] = normalize_phone(updates["phone"])
+    for k, v in updates.items():
         setattr(rider, k, v)
     db.commit()
     db.refresh(rider)
@@ -1662,6 +1693,232 @@ def rider_location(data: RiderLocationIn, payload=Depends(bearer_payload), db: S
     return {"ok": True, "updated_at": rider.location_updated_at.isoformat()}
 
 
+@app.post("/api/rider/heartbeat")
+def rider_heartbeat(payload=Depends(bearer_payload), db: Session = Depends(get_db)):
+    rid = require_rider(payload)
+    rider = db.get(Rider, rid)
+    if not rider or not rider.is_active:
+        raise HTTPException(403, "Rider account disabled")
+    rider.is_online = True
+    db.commit()
+    return {"ok": True}
+
+
+def _rider_period_window(period: str, date_from: str | None = None, date_to: str | None = None):
+    bounds = _uae_period_bounds()
+    if period == "all":
+        return None, None, "All Time"
+    if period == "today":
+        return bounds["today"], None, "Today"
+    if period == "yesterday":
+        return bounds["yesterday"], bounds["today"], "Yesterday"
+    if period == "week":
+        return bounds["week"], None, "This Week"
+    if period == "month":
+        return bounds["month"], None, "This Month"
+    if period == "year":
+        return bounds["year"], None, "This Year"
+    if period == "custom":
+        if not date_from or not date_to:
+            raise HTTPException(400, "Select custom from and to dates")
+        try:
+            tz = ZoneInfo("Asia/Dubai")
+            start_local = datetime.strptime(date_from, "%Y-%m-%d").replace(tzinfo=tz)
+            end_local = (datetime.strptime(date_to, "%Y-%m-%d") + timedelta(days=1)).replace(tzinfo=tz)
+            start = start_local.astimezone(timezone.utc).replace(tzinfo=None)
+            end = end_local.astimezone(timezone.utc).replace(tzinfo=None)
+            return start, end, f"{date_from} to {date_to}"
+        except ValueError:
+            raise HTTPException(400, "Use YYYY-MM-DD for custom dates")
+    raise HTTPException(400, "Invalid report period")
+
+
+def _rider_cash_balance(db: Session, rider_id: int):
+    cash_filter = func.lower(Order.payment_method).like("%cash%")
+    cash_due = float(db.scalar(
+        select(func.coalesce(func.sum(Order.total), 0)).where(
+            Order.rider_id == rider_id,
+            Order.status == "delivered",
+            cash_filter,
+        )
+    ) or 0)
+    approved = float(db.scalar(
+        select(func.coalesce(func.sum(RiderCashSubmission.amount), 0)).where(
+            RiderCashSubmission.rider_id == rider_id,
+            RiderCashSubmission.status == "approved",
+        )
+    ) or 0)
+    awaiting = float(db.scalar(
+        select(func.coalesce(func.sum(RiderCashSubmission.amount), 0)).where(
+            RiderCashSubmission.rider_id == rider_id,
+            RiderCashSubmission.status == "pending",
+        )
+    ) or 0)
+    rejected = float(db.scalar(
+        select(func.coalesce(func.sum(RiderCashSubmission.amount), 0)).where(
+            RiderCashSubmission.rider_id == rider_id,
+            RiderCashSubmission.status == "rejected",
+        )
+    ) or 0)
+    return {
+        "cash_due_to_admin": round(cash_due, 2),
+        "approved_cash": round(approved, 2),
+        "awaiting_approval": round(awaiting, 2),
+        "rejected_cash": round(rejected, 2),
+        "remaining_to_submit": round(max(cash_due - approved - awaiting, 0), 2),
+        "total_pending_cash": round(max(cash_due - approved, 0), 2),
+    }
+
+
+@app.get("/api/rider/history")
+def rider_history(
+    period: str = Query("today"),
+    date_from: str | None = Query(None),
+    date_to: str | None = Query(None),
+    payload=Depends(bearer_payload),
+    db: Session = Depends(get_db),
+):
+    rid = require_rider(payload)
+    start, end, _ = _rider_period_window(period, date_from, date_to)
+    time_col = func.coalesce(Order.delivered_at, Order.created_at)
+    filters = [Order.rider_id == rid, Order.status == "delivered"]
+    if start is not None:
+        filters.append(time_col >= start)
+    if end is not None:
+        filters.append(time_col < end)
+    orders = db.scalars(
+        select(Order)
+        .options(selectinload(Order.items), selectinload(Order.shop), selectinload(Order.rider), selectinload(Order.delivery_meta))
+        .where(*filters)
+        .order_by(time_col.desc(), Order.id.desc())
+        .limit(300)
+    ).all()
+    return [order_json(o) for o in orders]
+
+
+@app.get("/api/rider/finance")
+def rider_finance(
+    period: str = Query("today"),
+    date_from: str | None = Query(None),
+    date_to: str | None = Query(None),
+    payload=Depends(bearer_payload),
+    db: Session = Depends(get_db),
+):
+    rid = require_rider(payload)
+    rider = db.get(Rider, rid)
+    if not rider:
+        raise HTTPException(404, "Rider not found")
+    start, end, label = _rider_period_window(period, date_from, date_to)
+    time_col = func.coalesce(Order.delivered_at, Order.created_at)
+    filters = [Order.rider_id == rid, Order.status == "delivered"]
+    if start is not None:
+        filters.append(time_col >= start)
+    if end is not None:
+        filters.append(time_col < end)
+    orders = db.scalars(select(Order).where(*filters).order_by(time_col.desc())).all()
+    cash_orders = [o for o in orders if "cash" in str(o.payment_method or "").lower()]
+    card_orders = [o for o in orders if o not in cash_orders]
+    customer_total = sum(float(o.total or 0) for o in orders)
+    delivery_charges = sum(float(o.delivery_fee or 0) for o in orders)
+    cash_collected = sum(float(o.total or 0) for o in cash_orders)
+    balance = _rider_cash_balance(db, rid)
+    submissions = int(db.scalar(select(func.count()).select_from(RiderCashSubmission).where(RiderCashSubmission.rider_id == rid)) or 0)
+    return {
+        "rider": rider_json(rider),
+        "period": {"key": period, "label": label, "date_from": date_from, "date_to": date_to},
+        "totals": {
+            "delivered_orders": len(orders),
+            "customer_total": round(customer_total, 2),
+            "delivery_charges": round(delivery_charges, 2),
+            "rider_tips": 0.0,
+            "rider_earnings": round(delivery_charges, 2),
+            "cash_collected": round(cash_collected, 2),
+            "cash_orders": len(cash_orders),
+            "card_orders": len(card_orders),
+        },
+        "settlements": {
+            "approved_cash": balance["approved_cash"],
+            "awaiting_approval": balance["awaiting_approval"],
+            "rejected_cash": balance["rejected_cash"],
+            "submissions": submissions,
+        },
+        "current_balance": balance,
+    }
+
+
+@app.get("/api/rider/cash-submissions")
+def rider_cash_submissions(payload=Depends(bearer_payload), db: Session = Depends(get_db)):
+    rid = require_rider(payload)
+    items = db.scalars(
+        select(RiderCashSubmission)
+        .where(RiderCashSubmission.rider_id == rid)
+        .order_by(RiderCashSubmission.id.desc())
+        .limit(100)
+    ).all()
+    return [{
+        "id": x.id,
+        "amount": float(x.amount or 0),
+        "status": x.status,
+        "rider_note": x.rider_note,
+        "admin_note": x.admin_note,
+        "reviewed_by": x.reviewed_by,
+        "submitted_at": x.submitted_at.isoformat() if x.submitted_at else None,
+        "reviewed_at": x.reviewed_at.isoformat() if x.reviewed_at else None,
+    } for x in items]
+
+
+@app.post("/api/rider/cash-submissions")
+def rider_submit_cash(data: RiderCashIn, payload=Depends(bearer_payload), db: Session = Depends(get_db)):
+    rid = require_rider(payload)
+    balance = _rider_cash_balance(db, rid)
+    amount = round(float(data.amount), 2)
+    if amount > balance["remaining_to_submit"] + 0.01:
+        raise HTTPException(409, f"Maximum cash available is AED {balance['remaining_to_submit']:.2f}")
+    item = RiderCashSubmission(rider_id=rid, amount=amount, rider_note=(data.note or "").strip() or None)
+    db.add(item)
+    db.commit()
+    db.refresh(item)
+    return {"ok": True, "id": item.id, "status": item.status}
+
+
+@app.get("/api/super/rider-cash")
+def super_rider_cash(payload=Depends(bearer_payload), db: Session = Depends(get_db)):
+    require_super(payload)
+    rows = db.scalars(select(RiderCashSubmission).order_by(RiderCashSubmission.id.desc()).limit(300)).all()
+    result = []
+    for x in rows:
+        rider = db.get(Rider, x.rider_id)
+        result.append({
+            "id": x.id, "rider_id": x.rider_id,
+            "rider_name": rider.name if rider else "Rider",
+            "rider_phone": rider.phone if rider else "",
+            "amount": float(x.amount or 0), "status": x.status,
+            "rider_note": x.rider_note, "admin_note": x.admin_note,
+            "submitted_at": x.submitted_at.isoformat() if x.submitted_at else None,
+            "reviewed_at": x.reviewed_at.isoformat() if x.reviewed_at else None,
+        })
+    return result
+
+
+@app.patch("/api/super/rider-cash/{submission_id}")
+def super_review_rider_cash(submission_id: int, data: RiderCashReviewIn, payload=Depends(bearer_payload), db: Session = Depends(get_db)):
+    require_super(payload)
+    item = db.get(RiderCashSubmission, submission_id)
+    if not item:
+        raise HTTPException(404, "Cash submission not found")
+    status = str(data.status or "").lower()
+    if status not in {"approved", "rejected"}:
+        raise HTTPException(400, "Status must be approved or rejected")
+    if item.status != "pending":
+        raise HTTPException(409, "This cash submission is already reviewed")
+    item.status = status
+    item.admin_note = (data.admin_note or "").strip() or None
+    item.reviewed_by = "Super Admin"
+    item.reviewed_at = datetime.utcnow()
+    db.commit()
+    return {"ok": True, "id": item.id, "status": item.status}
+
+
 @app.get("/api/rider/orders")
 def rider_orders(payload=Depends(bearer_payload), db: Session = Depends(get_db)):
     rid = require_rider(payload)
@@ -1681,22 +1938,39 @@ def rider_order_status(order_id: int, data: OrderStatusIn, payload=Depends(beare
     order = db.scalar(select(Order).where(Order.id == order_id, Order.rider_id == rid))
     if not order:
         raise HTTPException(404, "Assigned order not found")
-    if data.status not in {"accepted", "picked_up", "on_the_way", "delivered"}:
+    status = str(data.status or "").lower().strip()
+    if status not in {"accepted", "rejected", "picked_up", "on_the_way", "delivered"}:
         raise HTTPException(400, "Invalid rider status")
-    if data.status == "picked_up" and order.status != "ready":
-        raise HTTPException(409, "Kitchen has not marked the order ready yet")
-    previous_rider_status = order.rider_status
-    if data.status == "delivered" and previous_rider_status not in {"picked_up", "on_the_way"}:
-        raise HTTPException(409, "Mark the order picked up before delivered")
-    order.rider_status = data.status
-    if data.status == "picked_up":
+    current = str(order.rider_status or "assigned").lower().strip()
+    allowed = {
+        "assigned": {"accepted", "rejected"},
+        "accepted": {"picked_up", "rejected"},
+        "picked_up": {"on_the_way", "delivered"},
+        "on_the_way": {"delivered"},
+    }
+    if status == current:
+        return {"id": order.id, "status": order.status, "rider_status": order.rider_status}
+    if status not in allowed.get(current, set()):
+        raise HTTPException(409, f"Cannot change rider status from {current} to {status}")
+    if status == "picked_up" and order.status != "ready":
+        raise HTTPException(409, "Waiting for Kitchen Ready")
+    rider = db.get(Rider, rid)
+    if status == "rejected":
+        order.rider_id = None
+        order.rider_status = "unassigned"
+        order.assigned_at = None
+        if rider:
+            rider.is_available = True
+        db.commit()
+        return {"id": order.id, "status": order.status, "rider_status": "rejected"}
+    order.rider_status = status
+    if status == "picked_up":
         order.picked_up_at = datetime.utcnow()
-    elif data.status == "on_the_way" and not order.picked_up_at:
+    elif status == "on_the_way" and not order.picked_up_at:
         order.picked_up_at = datetime.utcnow()
-    elif data.status == "delivered":
+    elif status == "delivered":
         order.delivered_at = datetime.utcnow()
         order.status = "delivered"
-        rider = db.get(Rider, rid)
         if rider:
             rider.is_available = True
     db.commit()

@@ -106,21 +106,40 @@ class AdminUpdate(BaseModel):
     permissions: dict[str, bool] | None = None
 
 
+class RiderLoginIn(BaseModel):
+    phone: str | None = None
+    pin: str | None = None
+    email: str | None = None
+    password: str | None = None
+
+
 class RiderCreate(BaseModel):
     name: str
-    email: str
     phone: str
-    password: str = Field(min_length=6)
+    pin: str | None = Field(default=None, min_length=4, max_length=12)
+    email: str | None = None
+    password: str | None = Field(default=None, min_length=4)
     photo_url: str | None = None
 
 
 class RiderUpdate(BaseModel):
     name: str | None = None
     phone: str | None = None
+    pin: str | None = Field(default=None, min_length=4, max_length=12)
     photo_url: str | None = None
     is_active: bool | None = None
     is_online: bool | None = None
     is_available: bool | None = None
+
+
+class RiderCashIn(BaseModel):
+    amount: float = Field(gt=0)
+    note: str | None = Field(default=None, max_length=500)
+
+
+class RiderCashReviewIn(BaseModel):
+    status: str
+    admin_note: str | None = Field(default=None, max_length=500)
 
 
 class RiderStatusIn(BaseModel):
