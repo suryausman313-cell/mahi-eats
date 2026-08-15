@@ -1,3 +1,4 @@
+from typing import Any
 from pydantic import BaseModel, Field
 
 
@@ -79,6 +80,11 @@ class ShopSettingsIn(BaseModel):
     description: str | None = None
     logo_url: str | None = None
     banner_url: str | None = None
+    service_fee_enabled: bool | None = None
+    service_fee: float | None = Field(default=None, ge=0)
+    small_order_fee_enabled: bool | None = None
+    small_order_threshold: float | None = Field(default=None, ge=0)
+    small_order_fee: float | None = Field(default=None, ge=0)
 
 
 class KitchenPinIn(BaseModel):
@@ -89,6 +95,15 @@ class AdminCreate(BaseModel):
     name: str = "Shop Admin"
     email: str
     password: str = Field(min_length=6)
+    role: str = "admin"
+    permissions: dict[str, bool] | None = None
+
+
+class AdminUpdate(BaseModel):
+    name: str | None = None
+    password: str | None = Field(default=None, min_length=6)
+    is_active: bool | None = None
+    permissions: dict[str, bool] | None = None
 
 
 class RiderCreate(BaseModel):
@@ -135,6 +150,13 @@ class DeliveryRuleIn(BaseModel):
 class DeliveryQuoteIn(BaseModel):
     latitude: float
     longitude: float
+    promo_code: str | None = None
+    subtotal: float | None = Field(default=None, ge=0)
+
+
+class PromoIn(BaseModel):
+    promo_code: str
+    subtotal: float = Field(ge=0)
 
 
 class MerchantRiderIn(BaseModel):
@@ -143,23 +165,83 @@ class MerchantRiderIn(BaseModel):
 
 
 class CategoryIn(BaseModel):
-    name: str
+    name: str = Field(min_length=1, max_length=120)
     sort_order: int = 0
     is_active: bool = True
 
 
+class SizeIn(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    price: float = Field(gt=0)
+
+
 class ProductIn(BaseModel):
     category_id: int | None = None
-    name: str
+    name: str = Field(min_length=1, max_length=180)
     description: str | None = None
     price: float = Field(gt=0)
     image_url: str | None = None
     is_active: bool = True
+    sizes: list[SizeIn] = []
+    has_extras: bool = False
+    is_popular: bool = False
+    discount_enabled: bool = False
+    discount_type: str = "percentage"
+    discount_value: float = Field(default=0, ge=0)
+
+
+class ExtraIn(BaseModel):
+    name: str = Field(min_length=1, max_length=140)
+    price: float = Field(default=0, ge=0)
+    is_active: bool = True
+
+
+class OfferIn(BaseModel):
+    title: str = Field(min_length=1, max_length=180)
+    promo_code: str = Field(min_length=1, max_length=60)
+    discount_type: str = "percentage"
+    discount_value: float = Field(gt=0)
+    minimum_order: float = Field(default=0, ge=0)
+    maximum_discount: float = Field(default=0, ge=0)
+    first_order_only: bool = False
+    usage_limit_per_customer: int = Field(default=0, ge=0)
+    is_active: bool = True
+
+
+class DealRuleIn(BaseModel):
+    category_id: int
+    quantity: int = Field(default=1, ge=1, le=20)
+    label: str | None = None
+
+
+class DealIn(BaseModel):
+    title: str = Field(min_length=1, max_length=180)
+    description: str | None = None
+    price: float = Field(gt=0)
+    image_url: str | None = None
+    rules: list[DealRuleIn] = []
+    is_active: bool = True
+
+
+class NotificationIn(BaseModel):
+    title: str = Field(min_length=1, max_length=180)
+    message: str = Field(min_length=1)
+    is_active: bool = True
+
+
+class FeedbackIn(BaseModel):
+    order_id: int | None = None
+    rating: int = Field(ge=1, le=5)
+    comment: str | None = None
 
 
 class OrderLineIn(BaseModel):
-    product_id: int
+    product_id: int | None = None
+    deal_id: int | None = None
     qty: int = Field(ge=1, le=50)
+    size_name: str | None = None
+    extra_ids: list[int] = []
+    deal_selections: dict[str, Any] | None = None
 
 
 class OrderCreate(BaseModel):
@@ -169,6 +251,7 @@ class OrderCreate(BaseModel):
     customer_latitude: float | None = None
     customer_longitude: float | None = None
     payment_method: str = "cash"
+    promo_code: str | None = None
     items: list[OrderLineIn]
 
 

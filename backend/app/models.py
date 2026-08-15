@@ -28,6 +28,11 @@ class Shop(Base):
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
     is_open: Mapped[bool] = mapped_column(Boolean, default=True)
     operating_status: Mapped[str] = mapped_column(String(20), default="open")
+    service_fee_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    service_fee: Mapped[float] = mapped_column(Float, default=0)
+    small_order_fee_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    small_order_threshold: Mapped[float] = mapped_column(Float, default=20)
+    small_order_fee: Mapped[float] = mapped_column(Float, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     admins = relationship("ShopAdmin", back_populates="shop", cascade="all, delete-orphan")
     delivery_rule = relationship("ShopDeliveryRule", back_populates="shop", uselist=False, cascade="all, delete-orphan")
@@ -42,6 +47,8 @@ class ShopAdmin(Base):
     email: Mapped[str] = mapped_column(String(200), index=True)
     password_hash: Mapped[str] = mapped_column(Text)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    role: Mapped[str] = mapped_column(String(30), default="admin")
+    permissions_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     shop = relationship("Shop", back_populates="admins")
 
 
@@ -72,6 +79,83 @@ class Product(Base):
     price: Mapped[float] = mapped_column(Float)
     image_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    sizes_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    has_extras: Mapped[bool] = mapped_column(Boolean, default=False)
+    is_popular: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    discount_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    discount_type: Mapped[str] = mapped_column(String(20), default="percentage")
+    discount_value: Mapped[float] = mapped_column(Float, default=0)
+
+
+class Extra(Base):
+    __tablename__ = "extras"
+    __table_args__ = (Index("ix_extra_shop_active", "shop_id", "is_active"),)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    shop_id: Mapped[int] = mapped_column(ForeignKey("shops.id", ondelete="CASCADE"), index=True)
+    name: Mapped[str] = mapped_column(String(140))
+    price: Mapped[float] = mapped_column(Float, default=0)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+
+
+class Offer(Base):
+    __tablename__ = "offers"
+    __table_args__ = (UniqueConstraint("shop_id", "promo_code", name="uq_offer_shop_code"),)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    shop_id: Mapped[int] = mapped_column(ForeignKey("shops.id", ondelete="CASCADE"), index=True)
+    title: Mapped[str] = mapped_column(String(180))
+    promo_code: Mapped[str] = mapped_column(String(60), index=True)
+    discount_type: Mapped[str] = mapped_column(String(20), default="percentage")
+    discount_value: Mapped[float] = mapped_column(Float, default=0)
+    minimum_order: Mapped[float] = mapped_column(Float, default=0)
+    maximum_discount: Mapped[float] = mapped_column(Float, default=0)
+    first_order_only: Mapped[bool] = mapped_column(Boolean, default=False)
+    usage_limit_per_customer: Mapped[int] = mapped_column(Integer, default=0)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class Deal(Base):
+    __tablename__ = "deals"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    shop_id: Mapped[int] = mapped_column(ForeignKey("shops.id", ondelete="CASCADE"), index=True)
+    title: Mapped[str] = mapped_column(String(180))
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    price: Mapped[float] = mapped_column(Float, default=0)
+    image_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    rules_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class ShopNotification(Base):
+    __tablename__ = "shop_notifications"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    shop_id: Mapped[int] = mapped_column(ForeignKey("shops.id", ondelete="CASCADE"), index=True)
+    title: Mapped[str] = mapped_column(String(180))
+    message: Mapped[str] = mapped_column(Text)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class Feedback(Base):
+    __tablename__ = "feedback"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    shop_id: Mapped[int] = mapped_column(ForeignKey("shops.id", ondelete="CASCADE"), index=True)
+    order_id: Mapped[int | None] = mapped_column(ForeignKey("orders.id", ondelete="SET NULL"), nullable=True, index=True)
+    customer_phone: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    rating: Mapped[int] = mapped_column(Integer, default=5)
+    comment: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class ActivityLog(Base):
+    __tablename__ = "activity_logs"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    shop_id: Mapped[int] = mapped_column(ForeignKey("shops.id", ondelete="CASCADE"), index=True)
+    admin_id: Mapped[int | None] = mapped_column(ForeignKey("shop_admins.id", ondelete="SET NULL"), nullable=True)
+    action: Mapped[str] = mapped_column(String(160))
+    detail: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
 class Rider(Base):
@@ -116,6 +200,10 @@ class Order(Base):
     picked_up_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     delivered_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     subtotal: Mapped[float] = mapped_column(Float, default=0)
+    discount_amount: Mapped[float] = mapped_column(Float, default=0)
+    service_fee: Mapped[float] = mapped_column(Float, default=0)
+    small_order_fee: Mapped[float] = mapped_column(Float, default=0)
+    promo_code: Mapped[str | None] = mapped_column(String(60), nullable=True)
     delivery_fee: Mapped[float] = mapped_column(Float, default=0)
     total: Mapped[float] = mapped_column(Float, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
@@ -134,6 +222,10 @@ class OrderItem(Base):
     qty: Mapped[int] = mapped_column(Integer, default=1)
     unit_price: Mapped[float] = mapped_column(Float)
     line_total: Mapped[float] = mapped_column(Float)
+    size_name: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    extras_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    item_kind: Mapped[str] = mapped_column(String(20), default="product")
+    details_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     order = relationship("Order", back_populates="items")
 
 

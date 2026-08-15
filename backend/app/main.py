@@ -13,19 +13,29 @@ from sqlalchemy import func, inspect, select, text
 from sqlalchemy.orm import Session, selectinload
 
 from .database import Base, engine, get_db
-from .models import Category, CustomerAccount, Order, OrderDeliveryMeta, OrderItem, Product, Rider, Shop, ShopAdmin, ShopDeliveryRule
+from .models import (
+    ActivityLog, Category, CustomerAccount, Deal, Extra, Feedback, Offer, Order,
+    OrderDeliveryMeta, OrderItem, Product, Rider, Shop, ShopAdmin, ShopDeliveryRule, ShopNotification
+)
 from .schemas import (
     AdminCreate,
+    AdminUpdate,
     CustomerLoginIn,
     CustomerRegisterIn,
     DeliveryQuoteIn,
     DeliveryRuleIn,
+    DealIn,
+    ExtraIn,
+    FeedbackIn,
     AssignRiderIn,
     CategoryIn,
     KitchenLoginIn,
     KitchenPinIn,
     LoginIn,
     MerchantRiderIn,
+    NotificationIn,
+    OfferIn,
+    PromoIn,
     OrderCreate,
     OrderStatusIn,
     ProductIn,
@@ -54,20 +64,58 @@ from .security import (
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Create new V6 tables first, then add columns to existing production tables without resetting data.
     Base.metadata.create_all(bind=engine)
-    # V5: safely add operating_status to existing databases without resetting data.
+    migrations = {
+        "shops": {
+            "operating_status": "VARCHAR(20) DEFAULT 'open'",
+            "service_fee_enabled": "BOOLEAN DEFAULT FALSE",
+            "service_fee": "FLOAT DEFAULT 0",
+            "small_order_fee_enabled": "BOOLEAN DEFAULT FALSE",
+            "small_order_threshold": "FLOAT DEFAULT 20",
+            "small_order_fee": "FLOAT DEFAULT 0",
+        },
+        "shop_admins": {
+            "role": "VARCHAR(30) DEFAULT 'admin'",
+            "permissions_json": "TEXT",
+        },
+        "products": {
+            "sizes_json": "TEXT",
+            "has_extras": "BOOLEAN DEFAULT FALSE",
+            "is_popular": "BOOLEAN DEFAULT FALSE",
+            "discount_enabled": "BOOLEAN DEFAULT FALSE",
+            "discount_type": "VARCHAR(20) DEFAULT 'percentage'",
+            "discount_value": "FLOAT DEFAULT 0",
+        },
+        "orders": {
+            "discount_amount": "FLOAT DEFAULT 0",
+            "service_fee": "FLOAT DEFAULT 0",
+            "small_order_fee": "FLOAT DEFAULT 0",
+            "promo_code": "VARCHAR(60)",
+        },
+        "order_items": {
+            "size_name": "VARCHAR(80)",
+            "extras_json": "TEXT",
+            "item_kind": "VARCHAR(20) DEFAULT 'product'",
+            "details_json": "TEXT",
+        },
+    }
     try:
-        cols = {c["name"] for c in inspect(engine).get_columns("shops")}
-        if "operating_status" not in cols:
-            with engine.begin() as conn:
-                conn.execute(text("ALTER TABLE shops ADD COLUMN operating_status VARCHAR(20) DEFAULT 'open'"))
-                conn.execute(text("UPDATE shops SET operating_status = CASE WHEN is_open THEN 'open' ELSE 'closed' END"))
+        inspector = inspect(engine)
+        with engine.begin() as conn:
+            for table_name, columns in migrations.items():
+                existing = {c["name"] for c in inspector.get_columns(table_name)}
+                for name, sql_type in columns.items():
+                    if name not in existing:
+                        conn.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {name} {sql_type}"))
+            # Preserve current open/closed state while introducing the three-state switch.
+            conn.execute(text("UPDATE shops SET operating_status = CASE WHEN is_open THEN COALESCE(NULLIF(operating_status,''),'open') ELSE 'closed' END WHERE operating_status IS NULL OR operating_status = ''"))
     except Exception as exc:
-        print("V5 schema migration warning:", exc)
+        print("V6 schema migration warning:", exc)
     yield
 
 
-app = FastAPI(title="Mahi Eats API", version="5.0.0", lifespan=lifespan)
+app = FastAPI(title="Mahi Eats API", version="6.0.0", lifespan=lifespan)
 origins = [x.strip() for x in os.getenv("CORS_ORIGINS", "http://localhost:5173").split(",") if x.strip()]
 app.add_middleware(
     CORSMiddleware,
@@ -95,6 +143,62 @@ def normalize_phone(value: str) -> str:
 
 def customer_json(c: CustomerAccount):
     return {"id": c.id, "name": c.name, "phone": c.phone}
+
+
+def _loads(value, fallback):
+    if not value:
+        return fallback
+    try:
+        result = json.loads(value)
+        return result if result is not None else fallback
+    except (TypeError, ValueError):
+        return fallback
+
+
+def product_json(p: Product):
+    sizes = _loads(p.sizes_json, [])
+    if not sizes:
+        sizes = [{"name": "Regular", "price": float(p.price or 0)}]
+    return {
+        "id": p.id, "category_id": p.category_id, "name": p.name,
+        "description": p.description, "price": float(p.price or 0),
+        "image_url": p.image_url, "is_active": bool(p.is_active),
+        "sizes": sizes, "has_extras": bool(getattr(p, "has_extras", False)),
+        "is_popular": bool(getattr(p, "is_popular", False)),
+        "discount_enabled": bool(getattr(p, "discount_enabled", False)),
+        "discount_type": getattr(p, "discount_type", "percentage") or "percentage",
+        "discount_value": float(getattr(p, "discount_value", 0) or 0),
+    }
+
+
+def extra_json(x: Extra):
+    return {"id": x.id, "name": x.name, "price": float(x.price or 0), "is_active": bool(x.is_active)}
+
+
+def offer_json(x: Offer):
+    return {"id": x.id, "title": x.title, "promo_code": x.promo_code, "discount_type": x.discount_type,
+            "discount_value": float(x.discount_value or 0), "minimum_order": float(x.minimum_order or 0),
+            "maximum_discount": float(x.maximum_discount or 0), "first_order_only": bool(x.first_order_only),
+            "usage_limit_per_customer": int(x.usage_limit_per_customer or 0), "is_active": bool(x.is_active)}
+
+
+def deal_json(x: Deal):
+    return {"id": x.id, "title": x.title, "description": x.description, "price": float(x.price or 0),
+            "image_url": x.image_url, "rules": _loads(x.rules_json, []), "is_active": bool(x.is_active)}
+
+
+def admin_permissions(a: ShopAdmin):
+    default = {"orders": True, "sales": True, "finance": True, "menu": True, "offers": True, "deals": True,
+               "customers": True, "notifications": True, "feedback": True, "logs": True, "accounts": a.role == "owner",
+               "settings": True, "kitchen": True}
+    saved = _loads(a.permissions_json, {})
+    default.update({str(k): bool(v) for k, v in saved.items()})
+    return default
+
+
+def activity(db: Session, shop_id: int, payload, action: str, detail: str = ""):
+    aid = int(payload.get("admin_id", 0)) if payload and payload.get("role") == "shop_admin" and payload.get("admin_id") else None
+    db.add(ActivityLog(shop_id=shop_id, admin_id=aid, action=action, detail=detail))
 
 
 def delivery_rule_json(rule: ShopDeliveryRule | None, shop: Shop | None = None):
@@ -194,6 +298,59 @@ def delivery_quote(db: Session, shop: Shop, latitude: float, longitude: float):
     }
 
 
+def _product_size_price(product: Product, size_name: str | None):
+    sizes = _loads(product.sizes_json, [])
+    if not sizes:
+        base = float(product.price or 0)
+        selected = None
+    else:
+        selected = None
+        if size_name:
+            for size in sizes:
+                if str(size.get("name", "")).strip().lower() == str(size_name).strip().lower():
+                    selected = size
+                    break
+        if selected is None:
+            selected = sizes[0]
+        base = float(selected.get("price", product.price) or product.price or 0)
+    final = base
+    if product.discount_enabled and float(product.discount_value or 0) > 0:
+        if (product.discount_type or "percentage") == "fixed":
+            final = max(0, base - float(product.discount_value or 0))
+        else:
+            final = max(0, base * (1 - float(product.discount_value or 0) / 100.0))
+    return round(final, 2), (str(selected.get("name")) if selected else (size_name or None)), round(base, 2)
+
+
+def _promo_discount(db: Session, shop: Shop, customer_phone: str, subtotal: float, promo_code: str | None):
+    if not promo_code:
+        return 0.0, None
+    code = promo_code.strip().upper()
+    offer = db.scalar(select(Offer).where(Offer.shop_id == shop.id, func.upper(Offer.promo_code) == code, Offer.is_active == True))
+    if not offer:
+        raise HTTPException(400, "Invalid or inactive promo code")
+    if subtotal < float(offer.minimum_order or 0):
+        raise HTTPException(400, f"Promo minimum order is AED {float(offer.minimum_order or 0):.2f}")
+    previous = int(db.scalar(select(func.count()).select_from(Order).where(
+        Order.shop_id == shop.id, Order.customer_phone == customer_phone, Order.status != "cancelled"
+    )) or 0)
+    if offer.first_order_only and previous > 0:
+        raise HTTPException(400, "This promo is for the first order only")
+    if int(offer.usage_limit_per_customer or 0) > 0:
+        used = int(db.scalar(select(func.count()).select_from(Order).where(
+            Order.shop_id == shop.id, Order.customer_phone == customer_phone, func.upper(Order.promo_code) == code, Order.status != "cancelled"
+        )) or 0)
+        if used >= int(offer.usage_limit_per_customer):
+            raise HTTPException(400, "Promo usage limit reached")
+    if offer.discount_type == "fixed":
+        amount = float(offer.discount_value or 0)
+    else:
+        amount = subtotal * float(offer.discount_value or 0) / 100.0
+    if float(offer.maximum_discount or 0) > 0:
+        amount = min(amount, float(offer.maximum_discount))
+    return round(min(subtotal, max(0, amount)), 2), offer
+
+
 def shop_json(s: Shop):
     return {
         "id": s.id,
@@ -218,6 +375,11 @@ def shop_json(s: Shop):
         "is_open": s.is_open,
         "operating_status": getattr(s, "operating_status", None) or ("open" if s.is_open else "closed"),
         "kitchen_ready": bool(s.kitchen_pin_hash),
+        "service_fee_enabled": bool(getattr(s, "service_fee_enabled", False)),
+        "service_fee": float(getattr(s, "service_fee", 0) or 0),
+        "small_order_fee_enabled": bool(getattr(s, "small_order_fee_enabled", False)),
+        "small_order_threshold": float(getattr(s, "small_order_threshold", 20) or 20),
+        "small_order_fee": float(getattr(s, "small_order_fee", 0) or 0),
     }
 
 
@@ -255,6 +417,10 @@ def order_json(o: Order, include_items: bool = True, public: bool = False):
         "merchant_rider_name": o.merchant_rider_name,
         "merchant_rider_phone": o.merchant_rider_phone,
         "subtotal": o.subtotal,
+        "discount_amount": float(getattr(o, "discount_amount", 0) or 0),
+        "service_fee": float(getattr(o, "service_fee", 0) or 0),
+        "small_order_fee": float(getattr(o, "small_order_fee", 0) or 0),
+        "promo_code": getattr(o, "promo_code", None),
         "delivery_fee": o.delivery_fee,
         "total": o.total,
         "delivery_distance_km": o.delivery_meta.distance_km if getattr(o, "delivery_meta", None) else None,
@@ -278,7 +444,12 @@ def order_json(o: Order, include_items: bool = True, public: bool = False):
     if o.rider:
         data["rider"] = rider_json(o.rider)
     if include_items:
-        data["items"] = [{"name": i.name, "qty": i.qty, "unit_price": i.unit_price, "line_total": i.line_total} for i in o.items]
+        data["items"] = [{
+            "name": i.name, "qty": i.qty, "unit_price": i.unit_price, "line_total": i.line_total,
+            "size_name": getattr(i, "size_name", None), "extras": _loads(getattr(i, "extras_json", None), []),
+            "item_kind": getattr(i, "item_kind", "product") or "product",
+            "details": _loads(getattr(i, "details_json", None), {}),
+        } for i in o.items]
     if public:
         data.pop("shop_id", None)
     return data
@@ -369,16 +540,20 @@ def _dispatch_rider_json(db: Session, rider: Rider, shop: Shop | None = None):
 def _uae_period_bounds():
     now = datetime.now(ZoneInfo("Asia/Dubai"))
     today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    yesterday = today - timedelta(days=1)
     week = today - timedelta(days=today.weekday())
     month = today.replace(day=1)
+    year = today.replace(month=1, day=1)
 
     def utc_naive(value):
         return value.astimezone(timezone.utc).replace(tzinfo=None)
 
     return {
         "today": utc_naive(today),
+        "yesterday": utc_naive(yesterday),
         "week": utc_naive(week),
         "month": utc_naive(month),
+        "year": utc_naive(year),
         "now": utc_naive(now),
     }
 
@@ -393,6 +568,9 @@ def _shop_period_stats(db: Session, shop: Shop, start: datetime | None = None):
     sales = float(db.scalar(select(func.coalesce(func.sum(Order.total), 0)).where(*filters)) or 0)
     food_sales = float(db.scalar(select(func.coalesce(func.sum(Order.subtotal), 0)).where(*filters)) or 0)
     delivery_fees = float(db.scalar(select(func.coalesce(func.sum(Order.delivery_fee), 0)).where(*filters)) or 0)
+    discounts = float(db.scalar(select(func.coalesce(func.sum(Order.discount_amount), 0)).where(*filters)) or 0)
+    service_fees = float(db.scalar(select(func.coalesce(func.sum(Order.service_fee), 0)).where(*filters)) or 0)
+    small_order_fees = float(db.scalar(select(func.coalesce(func.sum(Order.small_order_fee), 0)).where(*filters)) or 0)
     orders = int(db.scalar(select(func.count()).select_from(Order).where(*filters)) or 0)
     cancelled = int(db.scalar(select(func.count()).select_from(Order).where(*all_filters, Order.status == "cancelled")) or 0)
     pending = int(db.scalar(select(func.count()).select_from(Order).where(*all_filters, Order.status.not_in(["delivered", "cancelled"]))) or 0)
@@ -403,7 +581,7 @@ def _shop_period_stats(db: Session, shop: Shop, start: datetime | None = None):
     card_orders = max(orders - cash_orders, 0)
     commission = food_sales * float(shop.commission_percent or 0) / 100.0
     shop_delivery_income = delivery_fees if shop.delivery_mode == "shop" else 0.0
-    shop_receivable = max(food_sales - commission + shop_delivery_income, 0.0)
+    shop_receivable = max(food_sales - commission + service_fees + small_order_fees + shop_delivery_income, 0.0)
     return {
         "orders": orders,
         "pending": pending,
@@ -412,6 +590,9 @@ def _shop_period_stats(db: Session, shop: Shop, start: datetime | None = None):
         "customer_sales": sales,
         "food_sales": food_sales,
         "delivery_fees": delivery_fees,
+        "discounts": discounts,
+        "service_fees": service_fees,
+        "small_order_fees": small_order_fees,
         "cash_sales": cash_sales,
         "cash_orders": cash_orders,
         "card_sales": card_sales,
@@ -427,15 +608,17 @@ def _shop_dashboard(db: Session, shop: Shop):
     return {
         "shop": shop_json(shop),
         "today": _shop_period_stats(db, shop, bounds["today"]),
+        "yesterday": _shop_period_stats(db, shop, bounds["yesterday"]),
         "week": _shop_period_stats(db, shop, bounds["week"]),
         "month": _shop_period_stats(db, shop, bounds["month"]),
+        "year": _shop_period_stats(db, shop, bounds["year"]),
         "all": _shop_period_stats(db, shop, None),
     }
 
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "app": "Mahi Eats", "version": "4.0.0", "road_routing_ready": bool(GOOGLE_MAPS_API_KEY)}
+    return {"ok": True, "app": "Mahi Eats", "version": "6.0.0", "road_routing_ready": bool(GOOGLE_MAPS_API_KEY)}
 
 
 # ---------- AUTH ----------
@@ -454,7 +637,7 @@ def shop_login(data: LoginIn, db: Session = Depends(get_db)):
     shop = db.get(Shop, admin.shop_id)
     if not shop or not shop.is_active:
         raise HTTPException(403, "Shop is suspended")
-    return {"token": issue_token("shop_admin", shop_id=shop.id, admin_id=admin.id), "shop": shop_json(shop)}
+    return {"token": issue_token("shop_admin", shop_id=shop.id, admin_id=admin.id), "shop": shop_json(shop), "admin": {"id": admin.id, "name": admin.name, "email": admin.email, "role": admin.role, "permissions": admin_permissions(admin)}}
 
 
 @app.post("/api/kitchen/login")
@@ -538,15 +721,40 @@ def customer_orders(payload=Depends(bearer_payload), db: Session = Depends(get_d
 
 # ---------- CUSTOMER / PUBLIC ----------
 @app.get("/api/public/shops")
-def public_shops(q: str | None = Query(None), city: str | None = Query(None), db: Session = Depends(get_db)):
+def public_shops(
+    q: str | None = Query(None), city: str | None = Query(None),
+    latitude: float | None = Query(None), longitude: float | None = Query(None),
+    db: Session = Depends(get_db),
+):
     stmt = select(Shop).where(Shop.is_active == True)
     if q:
         term = f"%{q.strip()}%"
         stmt = stmt.where((Shop.name.ilike(term)) | (Shop.category.ilike(term)))
-    if city:
+    if city and latitude is None:
         stmt = stmt.where(Shop.city.ilike(f"%{city.strip()}%"))
     shops = db.scalars(stmt.order_by(Shop.is_open.desc(), Shop.name.asc()).limit(300)).all()
-    return [shop_json(s) for s in shops]
+    rows = []
+    for shop in shops:
+        row = shop_json(shop)
+        if latitude is not None and longitude is not None and shop.latitude is not None and shop.longitude is not None:
+            rule = delivery_rule_json(get_delivery_rule(db, shop), shop)
+            direct = km_distance(shop.latitude, shop.longitude, latitude, longitude)
+            max_km = float(rule.get("max_delivery_km") or 0)
+            # Direct-line distance is a cheap safe pre-filter: road distance can only be longer.
+            if max_km > 0 and direct is not None and direct > max_km:
+                continue
+            try:
+                quote = delivery_quote(db, shop, latitude, longitude)
+                if not quote["deliverable"]:
+                    continue
+                row["location_quote"] = quote
+            except HTTPException:
+                # Shops without map coordinates/config remain hidden in location mode.
+                continue
+        elif latitude is not None and longitude is not None:
+            continue
+        rows.append(row)
+    return rows
 
 
 @app.get("/api/public/shops/{slug}")
@@ -556,10 +764,18 @@ def public_shop(slug: str, db: Session = Depends(get_db)):
         raise HTTPException(404, "Shop not found")
     categories = db.scalars(select(Category).where(Category.shop_id == shop.id, Category.is_active == True).order_by(Category.sort_order, Category.name)).all()
     products = db.scalars(select(Product).where(Product.shop_id == shop.id, Product.is_active == True).order_by(Product.name)).all()
+    extras = db.scalars(select(Extra).where(Extra.shop_id == shop.id, Extra.is_active == True).order_by(Extra.name)).all()
+    offers = db.scalars(select(Offer).where(Offer.shop_id == shop.id, Offer.is_active == True).order_by(Offer.id.desc())).all()
+    deals = db.scalars(select(Deal).where(Deal.shop_id == shop.id, Deal.is_active == True).order_by(Deal.id.desc())).all()
+    notes = db.scalars(select(ShopNotification).where(ShopNotification.shop_id == shop.id, ShopNotification.is_active == True).order_by(ShopNotification.id.desc()).limit(5)).all()
     return {
         "shop": shop_json(shop),
         "categories": [{"id": c.id, "name": c.name, "sort_order": c.sort_order} for c in categories],
-        "products": [{"id": p.id, "category_id": p.category_id, "name": p.name, "description": p.description, "price": p.price, "image_url": p.image_url} for p in products],
+        "products": [product_json(p) for p in products],
+        "extras": [extra_json(x) for x in extras],
+        "offers": [offer_json(x) for x in offers],
+        "deals": [deal_json(x) for x in deals],
+        "notifications": [{"id": n.id, "title": n.title, "message": n.message} for n in notes],
     }
 
 
@@ -568,7 +784,23 @@ def public_delivery_quote(slug: str, data: DeliveryQuoteIn, db: Session = Depend
     shop = db.scalar(select(Shop).where(Shop.slug == slug, Shop.is_active == True))
     if not shop:
         raise HTTPException(404, "Shop not found")
-    return delivery_quote(db, shop, data.latitude, data.longitude)
+    quote = delivery_quote(db, shop, data.latitude, data.longitude)
+    subtotal = float(data.subtotal or 0)
+    service_fee = float(shop.service_fee or 0) if shop.service_fee_enabled else 0.0
+    small_fee = float(shop.small_order_fee or 0) if shop.small_order_fee_enabled and subtotal > 0 and subtotal < float(shop.small_order_threshold or 0) else 0.0
+    quote.update({"service_fee": round(service_fee, 2), "small_order_fee": round(small_fee, 2), "small_order_threshold": float(shop.small_order_threshold or 0)})
+    return quote
+
+
+@app.post("/api/public/shops/{slug}/promo")
+def public_promo(slug: str, data: PromoIn, payload=Depends(bearer_payload), db: Session = Depends(get_db)):
+    cid = require_customer(payload)
+    customer = db.get(CustomerAccount, cid)
+    shop = db.scalar(select(Shop).where(Shop.slug == slug, Shop.is_active == True))
+    if not shop or not customer:
+        raise HTTPException(404, "Shop or customer not found")
+    discount, offer = _promo_discount(db, shop, customer.phone, float(data.subtotal or 0), data.promo_code)
+    return {"discount_amount": discount, "offer": offer_json(offer) if offer else None}
 
 
 @app.post("/api/public/shops/{slug}/orders")
@@ -580,17 +812,65 @@ def create_order(slug: str, data: OrderCreate, payload=Depends(bearer_payload), 
     shop = db.scalar(select(Shop).where(Shop.slug == slug, Shop.is_active == True))
     if not shop:
         raise HTTPException(404, "Shop not found")
-    if not shop.is_open:
+    if not shop.is_open or shop.operating_status == "closed":
         raise HTTPException(409, "Shop is closed")
     if not data.items:
         raise HTTPException(400, "Cart is empty")
-    ids = [x.product_id for x in data.items]
-    products = db.scalars(select(Product).where(Product.shop_id == shop.id, Product.id.in_(ids), Product.is_active == True)).all()
-    pmap = {p.id: p for p in products}
-    if len(pmap) != len(set(ids)):
-        raise HTTPException(400, "One or more items are unavailable")
-    subtotal = sum(pmap[i.product_id].price * i.qty for i in data.items)
-    if subtotal < shop.min_order:
+
+    product_ids = [x.product_id for x in data.items if x.product_id]
+    deal_ids = [x.deal_id for x in data.items if x.deal_id]
+    products = db.scalars(select(Product).where(Product.shop_id == shop.id, Product.id.in_(product_ids), Product.is_active == True)).all() if product_ids else []
+    deals = db.scalars(select(Deal).where(Deal.shop_id == shop.id, Deal.id.in_(deal_ids), Deal.is_active == True)).all() if deal_ids else []
+    pmap, dmap = {p.id: p for p in products}, {d.id: d for d in deals}
+    extras = db.scalars(select(Extra).where(Extra.shop_id == shop.id, Extra.is_active == True)).all()
+    xmap = {x.id: x for x in extras}
+
+    priced_lines = []
+    subtotal = 0.0
+    for line in data.items:
+        if line.product_id:
+            p = pmap.get(line.product_id)
+            if not p:
+                raise HTTPException(400, "One or more items are unavailable")
+            price, size_name, original_price = _product_size_price(p, line.size_name)
+            picked_extras = []
+            extras_total = 0.0
+            if line.extra_ids and not p.has_extras:
+                raise HTTPException(400, f"{p.name} does not allow extras")
+            for xid in line.extra_ids:
+                x = xmap.get(xid)
+                if not x:
+                    raise HTTPException(400, "Invalid extra")
+                extras_total += float(x.price or 0)
+                picked_extras.append({"id": x.id, "name": x.name, "price": float(x.price or 0)})
+            unit = round(price + extras_total, 2)
+            total = round(unit * line.qty, 2)
+            subtotal += total
+            priced_lines.append({"kind": "product", "product": p, "name": p.name, "qty": line.qty, "unit": unit, "total": total, "size": size_name, "extras": picked_extras, "details": {"original_price": original_price}})
+        elif line.deal_id:
+            d = dmap.get(line.deal_id)
+            if not d:
+                raise HTTPException(400, "Deal is unavailable")
+            rules = _loads(d.rules_json, [])
+            selections = line.deal_selections or {}
+            # Validate that customer selected the configured number of product IDs from each category.
+            for rule in rules:
+                cat = str(rule.get("category_id"))
+                chosen = selections.get(cat, [])
+                if not isinstance(chosen, list) or len(chosen) != int(rule.get("quantity", 1)):
+                    raise HTTPException(400, f"Complete all selections for {d.title}")
+                valid_count = int(db.scalar(select(func.count()).select_from(Product).where(Product.shop_id == shop.id, Product.category_id == int(cat), Product.id.in_(chosen), Product.is_active == True)) or 0)
+                if valid_count != len(chosen):
+                    raise HTTPException(400, "Invalid deal selection")
+            unit = round(float(d.price or 0), 2)
+            total = round(unit * line.qty, 2)
+            subtotal += total
+            priced_lines.append({"kind": "deal", "deal": d, "name": d.title, "qty": line.qty, "unit": unit, "total": total, "size": None, "extras": [], "details": {"selections": selections}})
+        else:
+            raise HTTPException(400, "Invalid cart line")
+
+    subtotal = round(subtotal, 2)
+    if subtotal < float(shop.min_order or 0):
         raise HTTPException(400, f"Minimum order is AED {shop.min_order:.2f}")
 
     rule = get_delivery_rule(db, shop)
@@ -607,37 +887,32 @@ def create_order(slug: str, data: OrderCreate, payload=Depends(bearer_payload), 
     else:
         delivery_fee = float(rule_data["base_fee"] if rule else shop.delivery_fee or 0)
 
+    discount_amount, promo = _promo_discount(db, shop, customer.phone, subtotal, data.promo_code)
+    service_fee = float(shop.service_fee or 0) if shop.service_fee_enabled else 0.0
+    small_order_fee = float(shop.small_order_fee or 0) if shop.small_order_fee_enabled and subtotal < float(shop.small_order_threshold or 0) else 0.0
+    total = round(max(0, subtotal - discount_amount) + delivery_fee + service_fee + small_order_fee, 2)
+
     order = Order(
-        shop_id=shop.id,
-        customer_name=customer.name,
-        customer_phone=customer.phone,
-        delivery_address=data.delivery_address,
-        customer_latitude=data.customer_latitude,
-        customer_longitude=data.customer_longitude,
-        payment_method=data.payment_method,
-        delivery_mode=shop.delivery_mode,
-        subtotal=subtotal,
-        delivery_fee=delivery_fee,
-        total=subtotal + delivery_fee,
+        shop_id=shop.id, customer_name=customer.name, customer_phone=customer.phone,
+        delivery_address=data.delivery_address, customer_latitude=data.customer_latitude,
+        customer_longitude=data.customer_longitude, payment_method=data.payment_method,
+        delivery_mode=shop.delivery_mode, subtotal=subtotal, discount_amount=discount_amount,
+        service_fee=service_fee, small_order_fee=small_order_fee,
+        promo_code=promo.promo_code if promo else None, delivery_fee=delivery_fee, total=total,
     )
     db.add(order)
     db.flush()
-    for line in data.items:
-        p = pmap[line.product_id]
-        db.add(OrderItem(order_id=order.id, product_id=p.id, name=p.name, qty=line.qty, unit_price=p.price, line_total=p.price * line.qty))
-    if quote:
-        db.add(OrderDeliveryMeta(
-            order_id=order.id,
-            distance_km=quote["distance_km"],
-            duration_seconds=quote["duration_seconds"],
-            distance_source=quote["distance_source"],
-            base_fee=quote["base_fee"],
-            free_km=quote["free_km"],
-            per_km_fee=quote["per_km_fee"],
-            calculated_fee=delivery_fee,
+    for line in priced_lines:
+        product = line.get("product")
+        db.add(OrderItem(
+            order_id=order.id, product_id=product.id if product else None, name=line["name"], qty=line["qty"],
+            unit_price=line["unit"], line_total=line["total"], size_name=line["size"],
+            extras_json=json.dumps(line["extras"]), item_kind=line["kind"], details_json=json.dumps(line["details"]),
         ))
+    if quote:
+        db.add(OrderDeliveryMeta(order_id=order.id, distance_km=quote["distance_km"], duration_seconds=quote["duration_seconds"], distance_source=quote["distance_source"], base_fee=quote["base_fee"], free_km=quote["free_km"], per_km_fee=quote["per_km_fee"], calculated_fee=delivery_fee))
     db.commit()
-    return {"order_id": order.id, "total": order.total, "status": order.status, "tracking_phone": order.customer_phone, "delivery_fee": delivery_fee, "delivery_quote": quote}
+    return {"order_id": order.id, "subtotal": subtotal, "discount_amount": discount_amount, "service_fee": service_fee, "small_order_fee": small_order_fee, "delivery_fee": delivery_fee, "total": total, "status": order.status, "tracking_phone": order.customer_phone, "delivery_quote": quote}
 
 
 @app.get("/api/public/orders/{order_id}")
@@ -764,7 +1039,7 @@ def add_admin(shop_id: int, data: AdminCreate, payload=Depends(bearer_payload), 
         raise HTTPException(404, "Shop not found")
     if db.scalar(select(ShopAdmin).where(func.lower(ShopAdmin.email) == data.email.lower())):
         raise HTTPException(409, "This admin email is already used")
-    admin = ShopAdmin(shop_id=shop_id, name=data.name, email=data.email.lower(), password_hash=hash_password(data.password))
+    admin = ShopAdmin(shop_id=shop_id, name=data.name, email=data.email.lower(), password_hash=hash_password(data.password), role="owner", permissions_json=json.dumps(data.permissions or {}))
     db.add(admin)
     db.commit()
     return {"id": admin.id, "shop_id": shop_id, "name": admin.name, "email": admin.email}
@@ -922,7 +1197,11 @@ def shop_me(payload=Depends(bearer_payload), db: Session = Depends(get_db)):
     shop = db.get(Shop, sid)
     if not shop:
         raise HTTPException(404, "Shop not found")
-    return shop_json(shop)
+    data = shop_json(shop)
+    aid = payload.get("admin_id")
+    admin = db.get(ShopAdmin, int(aid)) if aid else None
+    data["admin"] = {"id": admin.id, "name": admin.name, "email": admin.email, "role": admin.role, "permissions": admin_permissions(admin)} if admin else None
+    return data
 
 
 @app.patch("/api/shop-admin/settings")
@@ -984,13 +1263,23 @@ def shop_reports(period: str = Query("today"), payload=Depends(bearer_payload), 
     if not shop:
         raise HTTPException(404, "Shop not found")
     bounds = _uae_period_bounds()
-    if period not in {"today", "week", "month", "all"}:
-        raise HTTPException(400, "period must be today, week, month or all")
+    if period not in {"today", "yesterday", "week", "month", "year", "all"}:
+        raise HTTPException(400, "period must be today, yesterday, week, month, year or all")
     start = None if period == "all" else bounds[period]
+    end = bounds["today"] if period == "yesterday" else None
     stats = _shop_period_stats(db, shop, start)
+    if end is not None:
+        # Recalculate the one-day window precisely.
+        qstats = select(Order).where(Order.shop_id == sid, Order.created_at >= start, Order.created_at < end, Order.status != "cancelled")
+        day_orders = db.scalars(qstats).all()
+        food_sales = sum(float(o.subtotal or 0) for o in day_orders); customer_sales = sum(float(o.total or 0) for o in day_orders)
+        cash_orders = [o for o in day_orders if "cash" in (o.payment_method or "").lower()]
+        stats.update({"orders": len(day_orders), "customer_sales": customer_sales, "food_sales": food_sales, "cash_sales": sum(float(o.total or 0) for o in cash_orders), "cash_orders": len(cash_orders), "card_sales": customer_sales-sum(float(o.total or 0) for o in cash_orders), "card_orders": len(day_orders)-len(cash_orders), "commission": food_sales*float(shop.commission_percent or 0)/100.0})
     q = select(Order).options(selectinload(Order.items), selectinload(Order.rider), selectinload(Order.shop)).where(Order.shop_id == sid)
     if start is not None:
         q = q.where(Order.created_at >= start)
+    if end is not None:
+        q = q.where(Order.created_at < end)
     orders = db.scalars(q.order_by(Order.id.desc()).limit(500)).all()
     return {"period": period, "stats": stats, "orders": [order_json(o) for o in orders]}
 
@@ -1005,9 +1294,8 @@ def admin_categories(payload=Depends(bearer_payload), db: Session = Depends(get_
 def admin_add_category(data: CategoryIn, payload=Depends(bearer_payload), db: Session = Depends(get_db)):
     sid = require_shop(payload)
     c = Category(shop_id=sid, **data.model_dump())
-    db.add(c)
-    db.commit()
-    db.refresh(c)
+    db.add(c); activity(db, sid, payload, "Category created", data.name)
+    db.commit(); db.refresh(c)
     return {"id": c.id, "name": c.name, "sort_order": c.sort_order, "is_active": c.is_active}
 
 
@@ -1015,49 +1303,204 @@ def admin_add_category(data: CategoryIn, payload=Depends(bearer_payload), db: Se
 def admin_edit_category(category_id: int, data: CategoryIn, payload=Depends(bearer_payload), db: Session = Depends(get_db)):
     sid = require_shop(payload)
     c = db.scalar(select(Category).where(Category.id == category_id, Category.shop_id == sid))
-    if not c:
-        raise HTTPException(404, "Category not found")
-    for k, v in data.model_dump().items():
-        setattr(c, k, v)
-    db.commit()
+    if not c: raise HTTPException(404, "Category not found")
+    for k, v in data.model_dump().items(): setattr(c, k, v)
+    activity(db, sid, payload, "Category updated", c.name); db.commit()
     return {"id": c.id, "name": c.name, "sort_order": c.sort_order, "is_active": c.is_active}
+
+
+@app.delete("/api/shop-admin/categories/{category_id}")
+def admin_delete_category(category_id: int, payload=Depends(bearer_payload), db: Session = Depends(get_db)):
+    sid = require_shop(payload)
+    c = db.scalar(select(Category).where(Category.id == category_id, Category.shop_id == sid))
+    if not c: raise HTTPException(404, "Category not found")
+    db.execute(text("UPDATE products SET category_id=NULL WHERE shop_id=:sid AND category_id=:cid"), {"sid": sid, "cid": category_id})
+    activity(db, sid, payload, "Category deleted", c.name); db.delete(c); db.commit()
+    return {"ok": True}
 
 
 @app.get("/api/shop-admin/products")
 def admin_products(payload=Depends(bearer_payload), db: Session = Depends(get_db)):
     sid = require_shop(payload)
-    ps = db.scalars(select(Product).where(Product.shop_id == sid).order_by(Product.id.desc())).all()
-    return [{"id": p.id, "category_id": p.category_id, "name": p.name, "description": p.description, "price": p.price, "image_url": p.image_url, "is_active": p.is_active} for p in ps]
+    return [product_json(p) for p in db.scalars(select(Product).where(Product.shop_id == sid).order_by(Product.id.desc())).all()]
 
 
 @app.post("/api/shop-admin/products")
 def admin_add_product(data: ProductIn, payload=Depends(bearer_payload), db: Session = Depends(get_db)):
     sid = require_shop(payload)
-    if data.category_id:
-        c = db.scalar(select(Category).where(Category.id == data.category_id, Category.shop_id == sid))
-        if not c:
-            raise HTTPException(400, "Invalid category")
-    p = Product(shop_id=sid, **data.model_dump())
-    db.add(p)
-    db.commit()
-    db.refresh(p)
-    return {"id": p.id, "name": p.name, "price": p.price}
+    if data.category_id and not db.scalar(select(Category).where(Category.id == data.category_id, Category.shop_id == sid)):
+        raise HTTPException(400, "Invalid category")
+    raw = data.model_dump(); sizes = raw.pop("sizes", [])
+    if sizes: raw["price"] = min(float(x["price"] if isinstance(x, dict) else x.price) for x in sizes)
+    p = Product(shop_id=sid, sizes_json=json.dumps([x if isinstance(x, dict) else x.model_dump() for x in sizes]), **raw)
+    db.add(p); activity(db, sid, payload, "Product created", p.name); db.commit(); db.refresh(p)
+    return product_json(p)
 
 
 @app.patch("/api/shop-admin/products/{product_id}")
 def admin_edit_product(product_id: int, data: ProductIn, payload=Depends(bearer_payload), db: Session = Depends(get_db)):
     sid = require_shop(payload)
     p = db.scalar(select(Product).where(Product.id == product_id, Product.shop_id == sid))
-    if not p:
-        raise HTTPException(404, "Product not found")
-    if data.category_id:
-        c = db.scalar(select(Category).where(Category.id == data.category_id, Category.shop_id == sid))
-        if not c:
-            raise HTTPException(400, "Invalid category")
-    for k, v in data.model_dump().items():
-        setattr(p, k, v)
-    db.commit()
-    return {"id": p.id, "name": p.name, "price": p.price, "is_active": p.is_active}
+    if not p: raise HTTPException(404, "Product not found")
+    if data.category_id and not db.scalar(select(Category).where(Category.id == data.category_id, Category.shop_id == sid)):
+        raise HTTPException(400, "Invalid category")
+    raw = data.model_dump(); sizes = raw.pop("sizes", [])
+    if sizes: raw["price"] = min(float(x["price"] if isinstance(x, dict) else x.price) for x in sizes)
+    raw["sizes_json"] = json.dumps([x if isinstance(x, dict) else x.model_dump() for x in sizes])
+    for k, v in raw.items(): setattr(p, k, v)
+    activity(db, sid, payload, "Product updated", p.name); db.commit()
+    return product_json(p)
+
+
+@app.delete("/api/shop-admin/products/{product_id}")
+def admin_delete_product(product_id: int, payload=Depends(bearer_payload), db: Session = Depends(get_db)):
+    sid = require_shop(payload)
+    p = db.scalar(select(Product).where(Product.id == product_id, Product.shop_id == sid))
+    if not p: raise HTTPException(404, "Product not found")
+    activity(db, sid, payload, "Product deleted", p.name); db.delete(p); db.commit(); return {"ok": True}
+
+
+@app.get("/api/shop-admin/extras")
+def admin_extras(payload=Depends(bearer_payload), db: Session = Depends(get_db)):
+    sid = require_shop(payload); return [extra_json(x) for x in db.scalars(select(Extra).where(Extra.shop_id == sid).order_by(Extra.id.desc())).all()]
+
+
+@app.post("/api/shop-admin/extras")
+def admin_add_extra(data: ExtraIn, payload=Depends(bearer_payload), db: Session = Depends(get_db)):
+    sid = require_shop(payload); x=Extra(shop_id=sid, **data.model_dump()); db.add(x); activity(db,sid,payload,"Extra created",x.name); db.commit(); db.refresh(x); return extra_json(x)
+
+
+@app.patch("/api/shop-admin/extras/{extra_id}")
+def admin_edit_extra(extra_id:int,data:ExtraIn,payload=Depends(bearer_payload),db:Session=Depends(get_db)):
+    sid=require_shop(payload); x=db.scalar(select(Extra).where(Extra.id==extra_id,Extra.shop_id==sid))
+    if not x: raise HTTPException(404,"Extra not found")
+    for k,v in data.model_dump().items(): setattr(x,k,v)
+    activity(db,sid,payload,"Extra updated",x.name); db.commit(); return extra_json(x)
+
+
+@app.delete("/api/shop-admin/extras/{extra_id}")
+def admin_delete_extra(extra_id:int,payload=Depends(bearer_payload),db:Session=Depends(get_db)):
+    sid=require_shop(payload); x=db.scalar(select(Extra).where(Extra.id==extra_id,Extra.shop_id==sid))
+    if not x: raise HTTPException(404,"Extra not found")
+    db.delete(x); activity(db,sid,payload,"Extra deleted",x.name); db.commit(); return {"ok":True}
+
+
+@app.get("/api/shop-admin/offers")
+def admin_offers(payload=Depends(bearer_payload),db:Session=Depends(get_db)):
+    sid=require_shop(payload); return [offer_json(x) for x in db.scalars(select(Offer).where(Offer.shop_id==sid).order_by(Offer.id.desc())).all()]
+
+
+@app.post("/api/shop-admin/offers")
+def admin_add_offer(data:OfferIn,payload=Depends(bearer_payload),db:Session=Depends(get_db)):
+    sid=require_shop(payload); raw=data.model_dump(); raw["promo_code"]=raw["promo_code"].strip().upper(); x=Offer(shop_id=sid,**raw); db.add(x)
+    try: activity(db,sid,payload,"Offer created",x.promo_code); db.commit(); db.refresh(x)
+    except Exception: db.rollback(); raise HTTPException(409,"Promo code already exists for this shop")
+    return offer_json(x)
+
+
+@app.patch("/api/shop-admin/offers/{offer_id}")
+def admin_edit_offer(offer_id:int,data:OfferIn,payload=Depends(bearer_payload),db:Session=Depends(get_db)):
+    sid=require_shop(payload); x=db.scalar(select(Offer).where(Offer.id==offer_id,Offer.shop_id==sid))
+    if not x: raise HTTPException(404,"Offer not found")
+    raw=data.model_dump(); raw["promo_code"]=raw["promo_code"].strip().upper()
+    for k,v in raw.items(): setattr(x,k,v)
+    activity(db,sid,payload,"Offer updated",x.promo_code); db.commit(); return offer_json(x)
+
+
+@app.delete("/api/shop-admin/offers/{offer_id}")
+def admin_delete_offer(offer_id:int,payload=Depends(bearer_payload),db:Session=Depends(get_db)):
+    sid=require_shop(payload); x=db.scalar(select(Offer).where(Offer.id==offer_id,Offer.shop_id==sid))
+    if not x: raise HTTPException(404,"Offer not found")
+    db.delete(x); activity(db,sid,payload,"Offer deleted",x.promo_code); db.commit(); return {"ok":True}
+
+
+@app.get("/api/shop-admin/deals")
+def admin_deals(payload=Depends(bearer_payload),db:Session=Depends(get_db)):
+    sid=require_shop(payload); return [deal_json(x) for x in db.scalars(select(Deal).where(Deal.shop_id==sid).order_by(Deal.id.desc())).all()]
+
+
+@app.post("/api/shop-admin/deals")
+def admin_add_deal(data:DealIn,payload=Depends(bearer_payload),db:Session=Depends(get_db)):
+    sid=require_shop(payload); raw=data.model_dump(); rules=raw.pop("rules",[]); x=Deal(shop_id=sid,rules_json=json.dumps(rules),**raw); db.add(x); activity(db,sid,payload,"Deal created",x.title); db.commit(); db.refresh(x); return deal_json(x)
+
+
+@app.patch("/api/shop-admin/deals/{deal_id}")
+def admin_edit_deal(deal_id:int,data:DealIn,payload=Depends(bearer_payload),db:Session=Depends(get_db)):
+    sid=require_shop(payload); x=db.scalar(select(Deal).where(Deal.id==deal_id,Deal.shop_id==sid))
+    if not x: raise HTTPException(404,"Deal not found")
+    raw=data.model_dump(); rules=raw.pop("rules",[]); raw["rules_json"]=json.dumps(rules)
+    for k,v in raw.items(): setattr(x,k,v)
+    activity(db,sid,payload,"Deal updated",x.title); db.commit(); return deal_json(x)
+
+
+@app.delete("/api/shop-admin/deals/{deal_id}")
+def admin_delete_deal(deal_id:int,payload=Depends(bearer_payload),db:Session=Depends(get_db)):
+    sid=require_shop(payload); x=db.scalar(select(Deal).where(Deal.id==deal_id,Deal.shop_id==sid))
+    if not x: raise HTTPException(404,"Deal not found")
+    db.delete(x); activity(db,sid,payload,"Deal deleted",x.title); db.commit(); return {"ok":True}
+
+
+@app.get("/api/shop-admin/notifications")
+def admin_notifications(payload=Depends(bearer_payload),db:Session=Depends(get_db)):
+    sid=require_shop(payload); return [{"id":x.id,"title":x.title,"message":x.message,"is_active":x.is_active,"created_at":x.created_at.isoformat()} for x in db.scalars(select(ShopNotification).where(ShopNotification.shop_id==sid).order_by(ShopNotification.id.desc())).all()]
+
+
+@app.post("/api/shop-admin/notifications")
+def admin_add_notification(data:NotificationIn,payload=Depends(bearer_payload),db:Session=Depends(get_db)):
+    sid=require_shop(payload); x=ShopNotification(shop_id=sid,**data.model_dump()); db.add(x); activity(db,sid,payload,"Notification created",x.title); db.commit(); db.refresh(x); return {"id":x.id,"title":x.title,"message":x.message,"is_active":x.is_active}
+
+
+@app.get("/api/shop-admin/customers")
+def admin_customers(payload=Depends(bearer_payload),db:Session=Depends(get_db)):
+    sid=require_shop(payload)
+    rows=db.execute(select(Order.customer_phone,func.max(Order.customer_name),func.count(Order.id),func.coalesce(func.sum(Order.total),0),func.max(Order.created_at)).where(Order.shop_id==sid,Order.status!="cancelled").group_by(Order.customer_phone).order_by(func.max(Order.created_at).desc())).all()
+    return [{"phone":r[0],"name":r[1],"orders":int(r[2]),"spend":float(r[3] or 0),"last_order":r[4].isoformat() if r[4] else None} for r in rows]
+
+
+@app.get("/api/shop-admin/feedback")
+def admin_feedback(payload=Depends(bearer_payload),db:Session=Depends(get_db)):
+    sid=require_shop(payload); return [{"id":x.id,"order_id":x.order_id,"customer_phone":x.customer_phone,"rating":x.rating,"comment":x.comment,"created_at":x.created_at.isoformat()} for x in db.scalars(select(Feedback).where(Feedback.shop_id==sid).order_by(Feedback.id.desc())).all()]
+
+
+@app.post("/api/public/shops/{slug}/feedback")
+def public_feedback(slug:str,data:FeedbackIn,payload=Depends(bearer_payload),db:Session=Depends(get_db)):
+    cid=require_customer(payload); customer=db.get(CustomerAccount,cid); shop=db.scalar(select(Shop).where(Shop.slug==slug,Shop.is_active==True))
+    if not customer or not shop: raise HTTPException(404,"Not found")
+    if data.order_id:
+        order=db.scalar(select(Order).where(Order.id==data.order_id,Order.shop_id==shop.id,Order.customer_phone==customer.phone))
+        if not order: raise HTTPException(404,"Order not found")
+    x=Feedback(shop_id=shop.id,order_id=data.order_id,customer_phone=customer.phone,rating=data.rating,comment=data.comment); db.add(x); db.commit(); return {"ok":True}
+
+
+@app.get("/api/shop-admin/activity-logs")
+def admin_activity_logs(payload=Depends(bearer_payload),db:Session=Depends(get_db)):
+    sid=require_shop(payload); return [{"id":x.id,"action":x.action,"detail":x.detail,"admin_id":x.admin_id,"created_at":x.created_at.isoformat()} for x in db.scalars(select(ActivityLog).where(ActivityLog.shop_id==sid).order_by(ActivityLog.id.desc()).limit(300)).all()]
+
+
+@app.get("/api/shop-admin/accounts")
+def admin_accounts(payload=Depends(bearer_payload),db:Session=Depends(get_db)):
+    sid=require_shop(payload); admins=db.scalars(select(ShopAdmin).where(ShopAdmin.shop_id==sid).order_by(ShopAdmin.id)).all(); return [{"id":a.id,"name":a.name,"email":a.email,"role":a.role,"is_active":a.is_active,"permissions":admin_permissions(a)} for a in admins]
+
+
+@app.post("/api/shop-admin/accounts")
+def admin_add_account(data:AdminCreate,payload=Depends(bearer_payload),db:Session=Depends(get_db)):
+    sid=require_shop(payload); current=db.get(ShopAdmin,int(payload.get("admin_id",0)))
+    if not current or current.role!="owner": raise HTTPException(403,"Owner account required")
+    if db.scalar(select(ShopAdmin).where(ShopAdmin.shop_id==sid,func.lower(ShopAdmin.email)==data.email.lower())): raise HTTPException(409,"Email already exists")
+    a=ShopAdmin(shop_id=sid,name=data.name,email=data.email.lower(),password_hash=hash_password(data.password),role=data.role,permissions_json=json.dumps(data.permissions or {})); db.add(a); activity(db,sid,payload,"Admin account created",a.email); db.commit(); db.refresh(a); return {"id":a.id,"email":a.email}
+
+
+@app.patch("/api/shop-admin/accounts/{admin_id}")
+def admin_update_account(admin_id:int,data:AdminUpdate,payload=Depends(bearer_payload),db:Session=Depends(get_db)):
+    sid=require_shop(payload); current=db.get(ShopAdmin,int(payload.get("admin_id",0)))
+    if not current or current.role!="owner": raise HTTPException(403,"Owner account required")
+    a=db.scalar(select(ShopAdmin).where(ShopAdmin.id==admin_id,ShopAdmin.shop_id==sid));
+    if not a: raise HTTPException(404,"Admin not found")
+    raw=data.model_dump(exclude_unset=True); password=raw.pop("password",None); permissions=raw.pop("permissions",None)
+    if password: a.password_hash=hash_password(password)
+    if permissions is not None: a.permissions_json=json.dumps(permissions)
+    for k,v in raw.items(): setattr(a,k,v)
+    activity(db,sid,payload,"Admin account updated",a.email); db.commit(); return {"ok":True}
 
 
 @app.get("/api/shop-admin/orders")
