@@ -1,1 +1,12 @@
-dsf
+{
+  "name": "Mahi Eats",
+  "short_name": "Mahi Eats",
+  "description": "Multi-shop food and local delivery marketplace",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f7f7f8",
+  "theme_color": "#ff5a1f",
+  "icons": [
+    {"src":"/mahi-icon.svg","sizes":"any","type":"image/svg+xml","purpose":"any maskable"}
+  ]
+}
