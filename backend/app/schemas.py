@@ -41,6 +41,7 @@ class ShopCreate(BaseModel):
     commission_percent: float = 0
     is_active: bool = True
     is_open: bool = True
+    operating_status: str = "open"
 
 
 class ShopUpdate(BaseModel):
@@ -61,10 +62,12 @@ class ShopUpdate(BaseModel):
     commission_percent: float | None = None
     is_active: bool | None = None
     is_open: bool | None = None
+    operating_status: str | None = None
 
 
 class ShopSettingsIn(BaseModel):
     is_open: bool | None = None
+    operating_status: str | None = None
     delivery_mode: str | None = None
     delivery_fee: float | None = None
     min_order: float | None = None

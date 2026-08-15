@@ -27,6 +27,7 @@ class Shop(Base):
     kitchen_pin_hash: Mapped[str | None] = mapped_column(Text, nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
     is_open: Mapped[bool] = mapped_column(Boolean, default=True)
+    operating_status: Mapped[str] = mapped_column(String(20), default="open")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     admins = relationship("ShopAdmin", back_populates="shop", cascade="all, delete-orphan")
     delivery_rule = relationship("ShopDeliveryRule", back_populates="shop", uselist=False, cascade="all, delete-orphan")

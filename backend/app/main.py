@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import func, select
+from sqlalchemy import func, inspect, select, text
 from sqlalchemy.orm import Session, selectinload
 
 from .database import Base, engine, get_db
@@ -55,14 +55,24 @@ from .security import (
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     Base.metadata.create_all(bind=engine)
+    # V5: safely add operating_status to existing databases without resetting data.
+    try:
+        cols = {c["name"] for c in inspect(engine).get_columns("shops")}
+        if "operating_status" not in cols:
+            with engine.begin() as conn:
+                conn.execute(text("ALTER TABLE shops ADD COLUMN operating_status VARCHAR(20) DEFAULT 'open'"))
+                conn.execute(text("UPDATE shops SET operating_status = CASE WHEN is_open THEN 'open' ELSE 'closed' END"))
+    except Exception as exc:
+        print("V5 schema migration warning:", exc)
     yield
 
 
-app = FastAPI(title="Mahi Eats API", version="4.0.0", lifespan=lifespan)
+app = FastAPI(title="Mahi Eats API", version="5.0.0", lifespan=lifespan)
 origins = [x.strip() for x in os.getenv("CORS_ORIGINS", "http://localhost:5173").split(",") if x.strip()]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
+    allow_origin_regex=r"https://([a-z0-9-]+\.)?mahi-eats\.pages\.dev",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -206,6 +216,7 @@ def shop_json(s: Shop):
         "commission_percent": s.commission_percent,
         "is_active": s.is_active,
         "is_open": s.is_open,
+        "operating_status": getattr(s, "operating_status", None) or ("open" if s.is_open else "closed"),
         "kitchen_ready": bool(s.kitchen_pin_hash),
     }
 
@@ -705,6 +716,14 @@ def edit_shop(shop_id: int, data: ShopUpdate, payload=Depends(bearer_payload), d
         raise HTTPException(400, "Invalid delivery mode")
     for k, v in updates.items():
         setattr(shop, k, v)
+    if "operating_status" in updates:
+        status = str(updates["operating_status"] or "open").lower()
+        if status not in {"open", "busy", "closed"}:
+            raise HTTPException(400, "Invalid shop status")
+        shop.operating_status = status
+        shop.is_open = status != "closed"
+    elif "is_open" in updates:
+        shop.operating_status = "open" if shop.is_open else "closed"
     db.commit()
     db.refresh(shop)
     return shop_json(shop)
@@ -914,6 +933,16 @@ def shop_settings(data: ShopSettingsIn, payload=Depends(bearer_payload), db: Ses
     protected = {"delivery_mode", "delivery_fee", "latitude", "longitude"}
     if protected.intersection(updates):
         raise HTTPException(403, "Delivery mode, shop map location and delivery pricing are controlled by Mahi Eats Super Admin")
+    status = updates.pop("operating_status", None)
+    if status is not None:
+        status = str(status).lower()
+        if status not in {"open", "busy", "closed"}:
+            raise HTTPException(400, "Invalid shop status")
+        shop.operating_status = status
+        shop.is_open = status != "closed"
+        updates.pop("is_open", None)
+    elif "is_open" in updates:
+        shop.operating_status = "open" if updates["is_open"] else "closed"
     for k, v in updates.items():
         setattr(shop, k, v)
     db.commit()
