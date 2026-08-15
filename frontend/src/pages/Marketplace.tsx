@@ -1,19 +1,84 @@
-import {useEffect,useState} from 'react';
+import {useEffect,useMemo,useState} from 'react';
 import {Link} from 'react-router-dom';
-import {Search,MapPin,Store,Clock3,Bike} from 'lucide-react';
+import {
+ Search,MapPin,Store,Clock3,Bike,ChevronDown,ShoppingBag,Home,ReceiptText,
+ Pizza,Coffee,IceCreamBowl,CupSoda,Beef,ShoppingBasket,HeartPulse,Flower2,
+ UtensilsCrossed,BadgePercent,Sparkles,Navigation,Languages,ChevronRight,UserRound
+} from 'lucide-react';
 import {request} from '../api';
 
-type Shop={id:number;name:string;slug:string;category:string;description?:string;logo_url?:string;city:string;delivery_fee:number;min_order:number;estimated_minutes:number;is_open:boolean};
+type Shop={id:number;name:string;slug:string;category:string;description?:string;logo_url?:string;banner_url?:string;city:string;delivery_fee:number;min_order:number;estimated_minutes:number;is_open:boolean;delivery_pricing?:{base_fee:number;per_km_fee:number;free_km:number;max_delivery_km:number;area_note?:string}};
+
+type CategoryKey='all'|'pizza'|'burger'|'coffee'|'dessert'|'juice'|'grocery'|'health'|'flowers';
+
+const categories:{key:CategoryKey;label:string;icon:any;match:string[]}[]=[
+ {key:'pizza',label:'Pizza',icon:Pizza,match:['pizza','italian']},
+ {key:'burger',label:'Burgers',icon:Beef,match:['burger','fast food']},
+ {key:'coffee',label:'Coffee',icon:Coffee,match:['coffee','cafe']},
+ {key:'dessert',label:'Desserts',icon:IceCreamBowl,match:['dessert','sweet','bakery','ice cream']},
+ {key:'juice',label:'Juice',icon:CupSoda,match:['juice','beverage']},
+ {key:'grocery',label:'Groceries',icon:ShoppingBasket,match:['grocery','market','supermarket']},
+ {key:'health',label:'Health',icon:HeartPulse,match:['health','pharmacy','medicine']},
+ {key:'flowers',label:'Flowers',icon:Flower2,match:['flower','gift']},
+];
+
+function categoryMatches(shop:Shop,cat:CategoryKey){
+ if(cat==='all')return true;
+ const row=categories.find(c=>c.key===cat);
+ const text=`${shop.category||''} ${shop.description||''} ${shop.name||''}`.toLowerCase();
+ return !!row?.match.some(k=>text.includes(k));
+}
 
 export default function Marketplace(){
  const [q,setQ]=useState(''); const [shops,setShops]=useState<Shop[]>([]); const [err,setErr]=useState('');
- useEffect(()=>{const t=setTimeout(()=>{setErr('');request('/api/public/shops'+(q?`?q=${encodeURIComponent(q)}`:'')).then(setShops).catch(e=>setErr(e.message))},220);return()=>clearTimeout(t)},[q]);
- return <main className="page">
-  <header className="topBrand"><Link to="/" className="brandMark"><span className="brandDot">M</span><b>Mahi Eats</b></Link><div className="topLinks"><Link to="/track/0">Track order</Link></div></header>
-  <header className="hero mahiHero"><div className="eyebrow">DELIVERY ACROSS YOUR CITY</div><h1>Good food, one app.</h1><p>Search restaurants, cafes and shops. Order from one Mahi Eats app.</p><div className="search"><Search size={20}/><input value={q} onChange={e=>setQ(e.target.value)} placeholder="Search shop, pizza, burger, cafe..."/></div></header>
-  <section><div className="sectionTitle"><h2>Restaurants & shops</h2><span>{shops.length} available</span></div>{err&&<div className="error">{err}</div>}
-   <div className="shopGrid">{shops.map(s=><Link className="shopCard" to={`/shop/${s.slug}`} key={s.id}><div className="shopLogo">{s.logo_url?<img src={s.logo_url} alt={s.name}/>:<Store/>}</div><div className="shopBody"><div className="row"><h3>{s.name}</h3><span className={s.is_open?'open':'closed'}>{s.is_open?'Open':'Closed'}</span></div><p>{s.category}{s.description?` · ${s.description}`:''}</p><div className="meta"><span><MapPin size={14}/>{s.city}</span><span><Bike size={14}/>AED {s.delivery_fee.toFixed(2)}</span><span><Clock3 size={14}/>{s.estimated_minutes} min</span>{s.min_order>0&&<span>Min AED {s.min_order.toFixed(2)}</span>}</div></div></Link>)}</div>
-   {shops.length===0&&!err&&<div className="empty">No active shops yet. Add the first shop from Super Admin.</div>}
+ const [category,setCategory]=useState<CategoryKey>('all'); const [freeOnly,setFreeOnly]=useState(false);
+ const [city,setCity]=useState(localStorage.getItem('mahi_city')||''); const [loading,setLoading]=useState(true);
+ useEffect(()=>{const t=setTimeout(()=>{setErr('');setLoading(true);let path='/api/public/shops';const params=new URLSearchParams();if(q)params.set('q',q);if(city)params.set('city',city);if([...params].length)path+=`?${params.toString()}`;request(path).then(setShops).catch(e=>setErr(e.message)).finally(()=>setLoading(false))},220);return()=>clearTimeout(t)},[q,city]);
+ const visible=useMemo(()=>shops.filter(s=>categoryMatches(s,category)&&(!freeOnly||Number(s.delivery_fee||0)===0)),[shops,category,freeOnly]);
+ const openCount=visible.filter(s=>s.is_open).length;
+ function changeArea(){const next=prompt('Enter your area or city (example: Fujairah). Leave blank to show all shops.',city);if(next===null)return;const value=next.trim();setCity(value);if(value)localStorage.setItem('mahi_city',value);else localStorage.removeItem('mahi_city')}
+ function useLocation(){if(!navigator.geolocation){changeArea();return}navigator.geolocation.getCurrentPosition(p=>{localStorage.setItem('mahi_lat',String(p.coords.latitude));localStorage.setItem('mahi_lng',String(p.coords.longitude));setCity('');localStorage.removeItem('mahi_city');alert('Delivery location saved. Exact shop delivery distance is calculated at checkout.')},()=>changeArea(),{enableHighAccuracy:true,timeout:8000})}
+ return <main className="marketPage">
+  <header className="marketTopbar">
+   <Link to="/" className="marketBrand"><span className="brandDot">M</span><b>Mahi Eats</b></Link>
+   <button className="locationSelect" onClick={changeArea}><MapPin/><span><small>Delivering to</small><b>{city||'All areas'}</b></span><ChevronDown/></button>
+   <div className="marketTopActions"><button className="iconAction" title="Use current location" onClick={useLocation}><Navigation/></button><Link className="iconAction" to="/orders" title="Orders"><ShoppingBag/></Link><Link className="iconAction" to="/account" title="Account"><UserRound/></Link><button className="iconAction" title="Language"><Languages/></button></div>
+  </header>
+
+  <section className="marketHero">
+   <div className="marketHeroText"><span className="marketKicker"><Sparkles/> Mahi Eats delivery</span><h1>What are you craving?</h1><p>Food, groceries and more from shops around you.</p></div>
+   <div className="marketSearch"><Search/><input value={q} onChange={e=>setQ(e.target.value)} placeholder="Search restaurants, dishes or shops"/></div>
   </section>
+
+  <section className="quickServices" aria-label="Services">
+   <button className={category==='all'?'serviceTile selected':''} onClick={()=>setCategory('all')}><span><UtensilsCrossed/></span><b>Food</b><small>{shops.length} shops</small></button>
+   <button className={category==='grocery'?'serviceTile selected':'serviceTile'} onClick={()=>setCategory('grocery')}><span><ShoppingBasket/></span><b>Groceries</b><small>Everyday essentials</small></button>
+   <button className={category==='health'?'serviceTile selected':'serviceTile'} onClick={()=>setCategory('health')}><span><HeartPulse/></span><b>Health</b><small>Wellness shops</small></button>
+   <button className={category==='flowers'?'serviceTile selected':'serviceTile'} onClick={()=>setCategory('flowers')}><span><Flower2/></span><b>Flowers</b><small>Gifts & more</small></button>
+  </section>
+
+  <section className="marketSection">
+   <div className="marketSectionHead"><div><small>DISCOVER</small><h2>What would you like?</h2></div></div>
+   <div className="roundCategories"><button className={category==='all'?'roundCat active':'roundCat'} onClick={()=>setCategory('all')}><span><UtensilsCrossed/></span><b>All</b></button>{categories.slice(0,5).map(c=>{const Icon=c.icon;return <button className={category===c.key?'roundCat active':'roundCat'} key={c.key} onClick={()=>setCategory(c.key)}><span><Icon/></span><b>{c.label}</b></button>})}</div>
+  </section>
+
+  <section className="promoStrip">
+   <article className="promoCard orange"><div><BadgePercent/><small>MAHI DEALS</small><h3>Offers near you</h3><p>Discover restaurants with great delivery value.</p></div><span className="promoArt">%</span></article>
+   <article className="promoCard dark"><div><Bike/><small>FAST DELIVERY</small><h3>Ready when you are</h3><p>See estimated time before you order.</p></div><span className="promoArt">⚡</span></article>
+   <article className="promoCard cream"><div><Store/><small>LOCAL FAVOURITES</small><h3>Explore your city</h3><p>Find new restaurants and local shops.</p></div><span className="promoArt">M</span></article>
+  </section>
+
+  <section className="marketSection restaurantSection">
+   <div className="marketSectionHead"><div><small>{city?city.toUpperCase():'MAHI EATS'}</small><h2>Restaurants & shops near you</h2></div><span>{loading?'Loading…':`${openCount} open`}</span></div>
+   <div className="filterChips"><button className={!freeOnly?'active':''} onClick={()=>setFreeOnly(false)}>All</button><button className={freeOnly?'active':''} onClick={()=>setFreeOnly(v=>!v)}><Bike/> Free delivery</button><button onClick={()=>{setQ('');setCategory('all');setFreeOnly(false)}}>Reset filters</button></div>
+   {err&&<div className="error marketError"><b>Could not load shops.</b><span>{err}</span></div>}
+   <div className="restaurantGrid">{visible.map(s=><Link className={`restaurantCard ${!s.is_open?'isClosed':''}`} to={`/shop/${s.slug}`} key={s.id}>
+    <div className="restaurantCover">{s.banner_url?<img src={s.banner_url} alt=""/>:s.logo_url?<img className="coverLogo" src={s.logo_url} alt=""/>:<Store/>}<div className="coverShade"/><span className={s.is_open?'openBadge':'closedBadge'}>{s.is_open?'Open':'Closed'}</span>{Number(s.delivery_fee||0)===0&&<span className="dealBadge"><Bike/> Free delivery</span>}</div>
+    <div className="restaurantInfo"><div className="restaurantTitle"><div className="miniLogo">{s.logo_url?<img src={s.logo_url} alt={s.name}/>:<Store/>}</div><div><h3>{s.name}</h3><p>{s.category}</p></div><ChevronRight/></div><div className="restaurantMeta"><span><Clock3/> {s.estimated_minutes} min</span><span><Bike/> {Number((s.delivery_pricing?.base_fee??s.delivery_fee)||0)===0?'From Free':`From AED ${Number((s.delivery_pricing?.base_fee??s.delivery_fee)||0).toFixed(2)}`}</span>{s.min_order>0&&<span>Min AED {Number(s.min_order).toFixed(0)}</span>}</div><small className="restaurantCity"><MapPin/> {s.city}{Number(s.delivery_pricing?.max_delivery_km||0)>0?` · up to ${Number(s.delivery_pricing?.max_delivery_km).toFixed(0)} km`:``}</small></div>
+   </Link>)}</div>
+   {!loading&&visible.length===0&&!err&&<div className="marketEmpty"><Store/><h3>No shops found</h3><p>Try another category/search or change your delivery area.</p><button onClick={()=>{setQ('');setCity('');localStorage.removeItem('mahi_city');setCategory('all');setFreeOnly(false)}}>Show all shops</button></div>}
+  </section>
+
+  <nav className="marketBottomNav"><Link className="active" to="/"><Home/><span>Home</span></Link><button onClick={()=>document.querySelector<HTMLInputElement>('.marketSearch input')?.focus()}><Search/><span>Search</span></button><Link to="/orders"><ReceiptText/><span>Orders</span></Link><Link to="/account"><UserRound/><span>Account</span></Link></nav>
  </main>
 }
