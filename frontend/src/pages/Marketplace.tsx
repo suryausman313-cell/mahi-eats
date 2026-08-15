@@ -1,9 +1,10 @@
 import {useEffect,useMemo,useState} from 'react';
 import {Link} from 'react-router-dom';
+import CustomerBottomNav from '../components/CustomerBottomNav';
 import {
- Search,MapPin,Store,Clock3,Bike,ChevronDown,ShoppingBag,Home,ReceiptText,
+ Search,MapPin,Store,Clock3,Bike,ChevronDown,
  Pizza,Coffee,IceCreamBowl,CupSoda,Beef,ShoppingBasket,HeartPulse,Flower2,
- UtensilsCrossed,BadgePercent,Sparkles,Navigation,Languages,ChevronRight,UserRound
+ UtensilsCrossed,BadgePercent,Sparkles,Navigation,ChevronRight
 } from 'lucide-react';
 import {request} from '../api';
 
@@ -42,7 +43,6 @@ export default function Marketplace(){
   <header className="marketTopbar">
    <Link to="/" className="marketBrand"><span className="brandDot">M</span><b>Mahi Eats</b></Link>
    <button className="locationSelect" onClick={coords?useLocation:changeArea}><MapPin/><span><small>Delivering to</small><b>{coords?'Current location':city||'Choose location'}</b></span><ChevronDown/></button>
-   <div className="marketTopActions"><button className="iconAction" title="Use current location" onClick={useLocation}><Navigation/></button><Link className="iconAction" to="/orders" title="Orders"><ShoppingBag/></Link><Link className="iconAction" to="/account" title="Account"><UserRound/></Link><button className="iconAction" title="Language"><Languages/></button></div>
   </header>
   {locating&&<div className="locationBanner"><Navigation/> Finding your current location…</div>}
   {locationDenied&&<button className="locationBanner denied" onClick={useLocation}><MapPin/> Allow location to show shops that deliver to you</button>}
@@ -54,6 +54,6 @@ export default function Marketplace(){
    <div className="restaurantGrid">{visible.map((s:any)=><Link className={`restaurantCard ${!s.is_open?'isClosed':''}`} to={`/shop/${s.slug}`} key={s.id}><div className="restaurantCover">{s.banner_url?<img src={s.banner_url} alt=""/>:s.logo_url?<img className="coverLogo" src={s.logo_url} alt=""/>:<Store/>}<div className="coverShade"/><span className={s.is_open?'openBadge':'closedBadge'}>{s.operating_status==='busy'?'Busy':s.is_open?'Open':'Closed'}</span>{Number((s.delivery_pricing?.base_fee??s.delivery_fee)||0)===0&&<span className="dealBadge"><Bike/> Free delivery</span>}</div><div className="restaurantInfo"><div className="restaurantTitle"><div className="miniLogo">{s.logo_url?<img src={s.logo_url} alt={s.name}/>:<Store/>}</div><div><h3>{s.name}</h3><p>{s.category}</p></div><ChevronRight/></div><div className="restaurantMeta"><span><Clock3/> {s.estimated_minutes}{s.operating_status==='busy'?'+15':''} min</span><span><Bike/> {Number((s.delivery_pricing?.base_fee??s.delivery_fee)||0)===0?'From Free':`From AED ${Number((s.delivery_pricing?.base_fee??s.delivery_fee)||0).toFixed(2)}`}</span>{coords&&s._directKm!=null&&<span><MapPin/> ~{Number(s._directKm).toFixed(1)} km away</span>}</div><small className="restaurantCity"><MapPin/> {s.city}{Number(s.delivery_pricing?.max_delivery_km||0)>0?` · delivers up to ${Number(s.delivery_pricing?.max_delivery_km).toFixed(0)} km`:``}</small></div></Link>)}</div>
    {!loading&&visible.length===0&&!err&&<div className="marketEmpty"><Store/><h3>No shops deliver here yet</h3><p>{coords?'Try refreshing your location or ask Super Admin to set each shop map location and delivery radius.':'Choose another area or use your current location.'}</p><button onClick={useLocation}>Use current location</button></div>}
   </section>
-  <nav className="marketBottomNav"><Link className="active" to="/"><Home/><span>Home</span></Link><button onClick={()=>document.querySelector<HTMLInputElement>('.marketSearch input')?.focus()}><Search/><span>Search</span></button><Link to="/orders"><ReceiptText/><span>Orders</span></Link><Link to="/account"><UserRound/><span>Account</span></Link></nav>
+  <CustomerBottomNav active="home" onMenu={()=>document.querySelector('.roundCategories')?.scrollIntoView({behavior:'smooth',block:'center'})}/>
  </main>
 }
