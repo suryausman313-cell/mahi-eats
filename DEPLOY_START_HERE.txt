@@ -1,0 +1,52 @@
+MAHI EATS - NEW STANDALONE PROJECT
+==================================
+DO NOT replace or connect this to the existing Fai Fai repo/service/database.
+
+Recommended names:
+GitHub repo: mahi-eats
+Render web service: mahi-eats-api
+Render PostgreSQL: mahi-eats-db
+Cloudflare Pages: mahi-eats
+
+1) GITHUB
+Create a NEW repo named mahi-eats.
+Upload the CONTENTS of this mahi-eats folder so backend/ and frontend/ are at the repo root.
+
+2) RENDER POSTGRESQL
+Create a NEW PostgreSQL database named mahi-eats-db.
+Copy its Internal Database URL.
+
+3) RENDER WEB SERVICE
+Connect the NEW mahi-eats GitHub repo.
+Root directory: backend
+Build command: pip install -r requirements.txt
+Start command: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+Health endpoint: /api/health
+
+Environment variables:
+DATABASE_URL = NEW Render PostgreSQL Internal Database URL
+APP_SECRET = LONG RANDOM SECRET (32+ characters recommended)
+SUPER_ADMIN_EMAIL = your Super Admin email
+SUPER_ADMIN_PASSWORD = your strong Super Admin password
+CORS_ORIGINS = first use http://localhost:5173, then replace with your NEW Cloudflare Pages URL
+
+4) CLOUDFLARE PAGES
+Create a NEW Pages project from the NEW mahi-eats GitHub repo.
+Root directory: frontend
+Build command: npm run build
+Build output: dist
+Environment variable:
+VITE_API_BASE_URL = https://YOUR-NEW-RENDER-API.onrender.com
+
+5) AFTER CLOUDFLARE DEPLOYS
+Copy the new Pages URL (example https://mahi-eats.pages.dev).
+In Render change CORS_ORIGINS to that exact URL and redeploy.
+
+6) FIRST SETUP
+Open /super-admin and login with SUPER_ADMIN_EMAIL / SUPER_ADMIN_PASSWORD.
+Create a shop -> Create Admin.
+Open /shop-admin with that shop admin -> Settings -> set Kitchen PIN and shop location.
+In Super Admin -> Riders -> create Mahi Eats riders.
+Riders login at /rider and start live location.
+Kitchen logs in at /kitchen using shop slug + Kitchen PIN.
+Customer uses the main / app.
