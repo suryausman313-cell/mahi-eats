@@ -265,8 +265,10 @@ def compute_road_distance(origin_lat: float, origin_lon: float, dest_lat: float,
                     duration_seconds = None
                 return round(float(route["distanceMeters"]) / 1000.0, 2), duration_seconds, "google_routes"
         except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, ValueError, KeyError):
-            pass
-    # Development fallback so the app can still be tested before a routing key is configured.
+            # Never charge a customer from a straight-line estimate when Google Routes is configured.
+            # If road routing fails, checkout should stop instead of calculating the wrong delivery fee.
+            return None, None, "google_routes_unavailable"
+    # Development-only fallback when no Google Routes key is configured.
     estimate = km_distance(origin_lat, origin_lon, dest_lat, dest_lon)
     return (round(float(estimate), 2) if estimate is not None else None), None, "straight_line_estimate"
 
@@ -973,17 +975,18 @@ def create_order(slug: str, data: OrderCreate, payload=Depends(bearer_payload), 
     rule_data = delivery_rule_json(rule, shop)
     if not bool(rule_data.get("is_enabled", True)):
         raise HTTPException(409, "Delivery is disabled for this shop")
-    dynamic_delivery = bool(float(rule_data["per_km_fee"] or 0) > 0 or float(rule_data["max_delivery_km"] or 0) > 0 or float(rule_data["free_km"] or 0) > 0)
-    quote = None
-    if dynamic_delivery:
-        if data.customer_latitude is None or data.customer_longitude is None:
-            raise HTTPException(400, "Add your delivery location to calculate road distance and delivery fee")
-        quote = delivery_quote(db, shop, data.customer_latitude, data.customer_longitude)
-        if not quote["deliverable"]:
-            raise HTTPException(409, f"This shop delivers up to {quote['max_delivery_km']:.1f} km by road")
-        delivery_fee = float(quote["delivery_fee"])
-    else:
-        delivery_fee = float(rule_data["base_fee"] if rule else shop.delivery_fee or 0)
+
+    # Every Mahi Eats delivery must have an exact customer pin. This guarantees the rider gets
+    # a customer map location and the customer is charged from the actual driving route.
+    if data.customer_latitude is None or data.customer_longitude is None:
+        raise HTTPException(400, "Select your exact delivery location on the map")
+
+    quote = delivery_quote(db, shop, data.customer_latitude, data.customer_longitude)
+    if not quote["deliverable"]:
+        raise HTTPException(409, f"This shop delivers up to {quote['max_delivery_km']:.1f} km by road")
+    if GOOGLE_MAPS_API_KEY and quote.get("distance_source") != "google_routes":
+        raise HTTPException(503, "Road distance is temporarily unavailable. Please try again.")
+    delivery_fee = float(quote["delivery_fee"])
 
     discount_amount, promo = _promo_discount(db, shop, customer.phone, subtotal, data.promo_code)
     service_fee = service_fee_for(shop, subtotal, "delivery")
@@ -2006,6 +2009,40 @@ def rider_submit_cash(data: RiderCashIn, payload=Depends(bearer_payload), db: Se
     return {"ok": True, "id": item.id, "status": item.status}
 
 
+
+@app.get("/api/super/feedback")
+def super_feedback(payload=Depends(bearer_payload), db: Session = Depends(get_db)):
+    require_super(payload)
+    rows = db.execute(
+        select(Feedback, Shop.name, Shop.slug)
+        .join(Shop, Shop.id == Feedback.shop_id)
+        .order_by(Feedback.id.desc())
+        .limit(1000)
+    ).all()
+    return [{
+        "id": feedback.id,
+        "shop_id": feedback.shop_id,
+        "shop_name": shop_name,
+        "shop_slug": shop_slug,
+        "order_id": feedback.order_id,
+        "customer_phone": feedback.customer_phone,
+        "rating": feedback.rating,
+        "comment": feedback.comment,
+        "created_at": feedback.created_at.isoformat(),
+    } for feedback, shop_name, shop_slug in rows]
+
+
+@app.delete("/api/super/feedback/{feedback_id}")
+def super_delete_feedback(feedback_id: int, payload=Depends(bearer_payload), db: Session = Depends(get_db)):
+    require_super(payload)
+    feedback = db.get(Feedback, feedback_id)
+    if not feedback:
+        raise HTTPException(404, "Feedback not found")
+    db.delete(feedback)
+    db.commit()
+    return {"ok": True}
+
+
 @app.get("/api/super/rider-cash")
 def super_rider_cash(payload=Depends(bearer_payload), db: Session = Depends(get_db)):
     require_super(payload)
@@ -2049,11 +2086,36 @@ def rider_orders(payload=Depends(bearer_payload), db: Session = Depends(get_db))
     rid = require_rider(payload)
     orders = db.scalars(
         select(Order)
-        .options(selectinload(Order.items), selectinload(Order.shop), selectinload(Order.rider))
+        .options(selectinload(Order.items), selectinload(Order.shop), selectinload(Order.rider), selectinload(Order.delivery_meta))
         .where(Order.rider_id == rid, Order.status.not_in(["cancelled"]), Order.rider_status != "delivered")
         .order_by(Order.id.asc())
         .limit(100)
     ).all()
+
+    # Backfill the road distance for an older active order if it already has an exact customer GPS pin.
+    # We do not change the old customer's price; this only gives the rider the correct route distance.
+    changed = False
+    for order in orders:
+        if order.delivery_meta is None and order.shop and order.customer_latitude is not None and order.customer_longitude is not None:
+            try:
+                quote = delivery_quote(db, order.shop, order.customer_latitude, order.customer_longitude)
+                if quote.get("distance_km") is not None:
+                    order.delivery_meta = OrderDeliveryMeta(
+                        order_id=order.id,
+                        distance_km=quote["distance_km"],
+                        duration_seconds=quote.get("duration_seconds"),
+                        distance_source=quote.get("distance_source"),
+                        base_fee=quote.get("base_fee", 0),
+                        free_km=quote.get("free_km", 0),
+                        per_km_fee=quote.get("per_km_fee", 0),
+                        calculated_fee=float(order.delivery_fee or 0),
+                    )
+                    db.add(order.delivery_meta)
+                    changed = True
+            except HTTPException:
+                pass
+    if changed:
+        db.commit()
     return [order_json(o) for o in orders]
 
 
