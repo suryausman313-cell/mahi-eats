@@ -74,6 +74,8 @@ async def lifespan(app: FastAPI):
             "operating_status": "VARCHAR(20) DEFAULT 'open'",
             "service_fee_enabled": "BOOLEAN DEFAULT FALSE",
             "service_fee": "FLOAT DEFAULT 0",
+            "service_fee_type": "VARCHAR(20) DEFAULT 'fixed'",
+            "service_fee_applies_to": "VARCHAR(20) DEFAULT 'delivery'",
             "small_order_fee_enabled": "BOOLEAN DEFAULT FALSE",
             "small_order_threshold": "FLOAT DEFAULT 20",
             "small_order_fee": "FLOAT DEFAULT 0",
@@ -118,7 +120,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="Mahi Eats API", version="7.0.0", lifespan=lifespan)
+app = FastAPI(title="Mahi Eats API", version="9.0.0", lifespan=lifespan)
 origins = [x.strip() for x in os.getenv("CORS_ORIGINS", "http://localhost:5173").split(",") if x.strip()]
 app.add_middleware(
     CORSMiddleware,
@@ -274,6 +276,8 @@ def delivery_quote(db: Session, shop: Shop, latitude: float, longitude: float):
         raise HTTPException(409, "Shop delivery location is not configured by Super Admin")
     rule = get_delivery_rule(db, shop)
     rule_data = delivery_rule_json(rule, shop)
+    if not bool(rule_data.get("is_enabled", True)):
+        raise HTTPException(409, "Delivery is disabled for this shop")
     distance_km, duration_seconds, source = compute_road_distance(shop.latitude, shop.longitude, latitude, longitude)
     if distance_km is None:
         raise HTTPException(503, "Could not calculate delivery distance")
@@ -299,6 +303,19 @@ def delivery_quote(db: Session, shop: Shop, latitude: float, longitude: float):
         "free_km": float(rule_data["free_km"] or 0),
         "per_km_fee": float(rule_data["per_km_fee"] or 0),
     }
+
+
+def service_fee_for(shop: Shop, subtotal: float, order_type: str = "delivery") -> float:
+    if not bool(getattr(shop, "service_fee_enabled", False)):
+        return 0.0
+    applies = str(getattr(shop, "service_fee_applies_to", "delivery") or "delivery").lower()
+    if applies not in {"both", order_type}:
+        return 0.0
+    amount = max(float(getattr(shop, "service_fee", 0) or 0), 0.0)
+    fee_type = str(getattr(shop, "service_fee_type", "fixed") or "fixed").lower()
+    if fee_type == "percentage":
+        return round(max(float(subtotal or 0), 0.0) * amount / 100.0, 2)
+    return round(amount, 2)
 
 
 def _product_size_price(product: Product, size_name: str | None):
@@ -380,10 +397,22 @@ def shop_json(s: Shop):
         "kitchen_ready": bool(s.kitchen_pin_hash),
         "service_fee_enabled": bool(getattr(s, "service_fee_enabled", False)),
         "service_fee": float(getattr(s, "service_fee", 0) or 0),
+        "service_fee_type": str(getattr(s, "service_fee_type", "fixed") or "fixed"),
+        "service_fee_applies_to": str(getattr(s, "service_fee_applies_to", "delivery") or "delivery"),
         "small_order_fee_enabled": bool(getattr(s, "small_order_fee_enabled", False)),
         "small_order_threshold": float(getattr(s, "small_order_threshold", 20) or 20),
         "small_order_fee": float(getattr(s, "small_order_fee", 0) or 0),
     }
+
+
+def shop_rating_summary(db: Session, shop_id: int):
+    row = db.execute(
+        select(func.avg(Feedback.rating), func.count(Feedback.id))
+        .where(Feedback.shop_id == shop_id)
+    ).one()
+    average = round(float(row[0] or 0), 1)
+    count = int(row[1] or 0)
+    return {"rating_average": average, "rating_count": count}
 
 
 def rider_json(r: Rider, private: bool = False):
@@ -582,9 +611,11 @@ def _shop_period_stats(db: Session, shop: Shop, start: datetime | None = None):
     cash_orders = int(db.scalar(select(func.count()).select_from(Order).where(*filters, func.lower(Order.payment_method).like("%cash%"))) or 0)
     card_sales = max(sales - cash_sales, 0.0)
     card_orders = max(orders - cash_orders, 0)
-    commission = food_sales * float(shop.commission_percent or 0) / 100.0
+    net_food_sales = max(food_sales - discounts, 0.0)
+    commission = net_food_sales * float(shop.commission_percent or 0) / 100.0
+    platform_fees = commission + service_fees + small_order_fees
     shop_delivery_income = delivery_fees if shop.delivery_mode == "shop" else 0.0
-    shop_receivable = max(food_sales - commission + service_fees + small_order_fees + shop_delivery_income, 0.0)
+    shop_receivable = max(net_food_sales - commission + shop_delivery_income, 0.0)
     return {
         "orders": orders,
         "pending": pending,
@@ -592,6 +623,7 @@ def _shop_period_stats(db: Session, shop: Shop, start: datetime | None = None):
         "cancelled": cancelled,
         "customer_sales": sales,
         "food_sales": food_sales,
+        "shop_food_sale": net_food_sales,
         "delivery_fees": delivery_fees,
         "discounts": discounts,
         "service_fees": service_fees,
@@ -601,6 +633,7 @@ def _shop_period_stats(db: Session, shop: Shop, start: datetime | None = None):
         "card_sales": card_sales,
         "card_orders": card_orders,
         "commission": commission,
+        "platform_fees": platform_fees,
         "commission_percent": float(shop.commission_percent or 0),
         "shop_receivable": shop_receivable,
     }
@@ -621,7 +654,7 @@ def _shop_dashboard(db: Session, shop: Shop):
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "app": "Mahi Eats", "version": "6.0.0", "road_routing_ready": bool(GOOGLE_MAPS_API_KEY)}
+    return {"ok": True, "app": "Mahi Eats", "version": "9.0.0", "road_routing_ready": bool(GOOGLE_MAPS_API_KEY)}
 
 
 # ---------- AUTH ----------
@@ -733,7 +766,28 @@ def customer_orders(payload=Depends(bearer_payload), db: Session = Depends(get_d
         .order_by(Order.id.desc())
         .limit(200)
     ).all()
-    return [order_json(o, public=True) for o in orders]
+    order_ids = [o.id for o in orders]
+    feedback_by_order = {}
+    if order_ids:
+        feedback_rows = db.scalars(
+            select(Feedback)
+            .where(
+                Feedback.customer_phone == customer.phone,
+                Feedback.order_id.in_(order_ids),
+            )
+            .order_by(Feedback.id.desc())
+        ).all()
+        for fb in feedback_rows:
+            if fb.order_id not in feedback_by_order:
+                feedback_by_order[fb.order_id] = fb
+    result = []
+    for order in orders:
+        row = order_json(order, public=True)
+        fb = feedback_by_order.get(order.id)
+        row["my_rating"] = fb.rating if fb else None
+        row["my_review"] = fb.comment if fb else None
+        result.append(row)
+    return result
 
 
 # ---------- CUSTOMER / PUBLIC ----------
@@ -750,9 +804,21 @@ def public_shops(
     if city and latitude is None:
         stmt = stmt.where(Shop.city.ilike(f"%{city.strip()}%"))
     shops = db.scalars(stmt.order_by(Shop.is_open.desc(), Shop.name.asc()).limit(300)).all()
+    rating_rows = db.execute(
+        select(Feedback.shop_id, func.avg(Feedback.rating), func.count(Feedback.id))
+        .group_by(Feedback.shop_id)
+    ).all()
+    ratings = {
+        int(shop_id): {
+            "rating_average": round(float(avg_rating or 0), 1),
+            "rating_count": int(review_count or 0),
+        }
+        for shop_id, avg_rating, review_count in rating_rows
+    }
     rows = []
     for shop in shops:
         row = shop_json(shop)
+        row.update(ratings.get(shop.id, {"rating_average": 0.0, "rating_count": 0}))
         if latitude is not None and longitude is not None and shop.latitude is not None and shop.longitude is not None:
             rule = delivery_rule_json(get_delivery_rule(db, shop), shop)
             direct = km_distance(shop.latitude, shop.longitude, latitude, longitude)
@@ -785,14 +851,27 @@ def public_shop(slug: str, db: Session = Depends(get_db)):
     offers = db.scalars(select(Offer).where(Offer.shop_id == shop.id, Offer.is_active == True).order_by(Offer.id.desc())).all()
     deals = db.scalars(select(Deal).where(Deal.shop_id == shop.id, Deal.is_active == True).order_by(Deal.id.desc())).all()
     notes = db.scalars(select(ShopNotification).where(ShopNotification.shop_id == shop.id, ShopNotification.is_active == True).order_by(ShopNotification.id.desc()).limit(5)).all()
+    rating = shop_rating_summary(db, shop.id)
+    recent_reviews = db.scalars(
+        select(Feedback)
+        .where(Feedback.shop_id == shop.id)
+        .order_by(Feedback.id.desc())
+        .limit(12)
+    ).all()
     return {
-        "shop": shop_json(shop),
+        "shop": {**shop_json(shop), **rating},
         "categories": [{"id": c.id, "name": c.name, "sort_order": c.sort_order} for c in categories],
         "products": [product_json(p) for p in products],
         "extras": [extra_json(x) for x in extras],
         "offers": [offer_json(x) for x in offers],
         "deals": [deal_json(x) for x in deals],
         "notifications": [{"id": n.id, "title": n.title, "message": n.message} for n in notes],
+        "reviews": [{
+            "id": x.id,
+            "rating": x.rating,
+            "comment": x.comment,
+            "created_at": x.created_at.isoformat(),
+        } for x in recent_reviews],
     }
 
 
@@ -803,7 +882,7 @@ def public_delivery_quote(slug: str, data: DeliveryQuoteIn, db: Session = Depend
         raise HTTPException(404, "Shop not found")
     quote = delivery_quote(db, shop, data.latitude, data.longitude)
     subtotal = float(data.subtotal or 0)
-    service_fee = float(shop.service_fee or 0) if shop.service_fee_enabled else 0.0
+    service_fee = service_fee_for(shop, subtotal, "delivery")
     small_fee = float(shop.small_order_fee or 0) if shop.small_order_fee_enabled and subtotal > 0 and subtotal < float(shop.small_order_threshold or 0) else 0.0
     quote.update({"service_fee": round(service_fee, 2), "small_order_fee": round(small_fee, 2), "small_order_threshold": float(shop.small_order_threshold or 0)})
     return quote
@@ -892,6 +971,8 @@ def create_order(slug: str, data: OrderCreate, payload=Depends(bearer_payload), 
 
     rule = get_delivery_rule(db, shop)
     rule_data = delivery_rule_json(rule, shop)
+    if not bool(rule_data.get("is_enabled", True)):
+        raise HTTPException(409, "Delivery is disabled for this shop")
     dynamic_delivery = bool(float(rule_data["per_km_fee"] or 0) > 0 or float(rule_data["max_delivery_km"] or 0) > 0 or float(rule_data["free_km"] or 0) > 0)
     quote = None
     if dynamic_delivery:
@@ -905,7 +986,7 @@ def create_order(slug: str, data: OrderCreate, payload=Depends(bearer_payload), 
         delivery_fee = float(rule_data["base_fee"] if rule else shop.delivery_fee or 0)
 
     discount_amount, promo = _promo_discount(db, shop, customer.phone, subtotal, data.promo_code)
-    service_fee = float(shop.service_fee or 0) if shop.service_fee_enabled else 0.0
+    service_fee = service_fee_for(shop, subtotal, "delivery")
     small_order_fee = float(shop.small_order_fee or 0) if shop.small_order_fee_enabled and subtotal < float(shop.small_order_threshold or 0) else 0.0
     total = round(max(0, subtotal - discount_amount) + delivery_fee + service_fee + small_order_fee, 2)
 
@@ -954,10 +1035,20 @@ def super_stats(payload=Depends(bearer_payload), db: Session = Depends(get_db)):
     total_sales = float(db.scalar(select(func.coalesce(func.sum(Order.total), 0)).where(Order.status != "cancelled")) or 0)
     commission = float(
         db.scalar(
-            select(func.coalesce(func.sum(Order.subtotal * Shop.commission_percent / 100.0), 0)).join(Shop, Shop.id == Order.shop_id).where(Order.status != "cancelled")
+            select(
+    func.coalesce(
+        func.sum((Order.subtotal - Order.discount_amount) * Shop.commission_percent / 100.0),
+        0,
+    )
+).select_from(Order).join(
+    Shop, Shop.id == Order.shop_id
+).where(Order.status != "cancelled")
         )
         or 0
     )
+    service_fees = float(db.scalar(select(func.coalesce(func.sum(Order.service_fee), 0)).where(Order.status != "cancelled")) or 0)
+    small_order_fees = float(db.scalar(select(func.coalesce(func.sum(Order.small_order_fee), 0)).where(Order.status != "cancelled")) or 0)
+    platform_income = commission + service_fees + small_order_fees
     return {
         "shops": db.scalar(select(func.count()).select_from(Shop)) or 0,
         "active_shops": db.scalar(select(func.count()).select_from(Shop).where(Shop.is_active == True)) or 0,
@@ -973,6 +1064,9 @@ def super_stats(payload=Depends(bearer_payload), db: Session = Depends(get_db)):
         ) or 0,
         "sales": total_sales,
         "commission": commission,
+        "service_fees": service_fees,
+        "small_order_fees": small_order_fees,
+        "platform_income": platform_income,
         "road_routing_ready": bool(GOOGLE_MAPS_API_KEY),
     }
 
@@ -1006,6 +1100,10 @@ def edit_shop(shop_id: int, data: ShopUpdate, payload=Depends(bearer_payload), d
     updates = data.model_dump(exclude_unset=True)
     if "delivery_mode" in updates and updates["delivery_mode"] not in {"mahi_eats", "shop"}:
         raise HTTPException(400, "Invalid delivery mode")
+    if "service_fee_type" in updates and updates["service_fee_type"] not in {"fixed", "percentage"}:
+        raise HTTPException(400, "service_fee_type must be fixed or percentage")
+    if "service_fee_applies_to" in updates and updates["service_fee_applies_to"] not in {"pickup", "delivery", "both"}:
+        raise HTTPException(400, "Invalid service fee scope")
     for k, v in updates.items():
         setattr(shop, k, v)
     if "operating_status" in updates:
@@ -1495,12 +1593,39 @@ def admin_feedback(payload=Depends(bearer_payload),db:Session=Depends(get_db)):
 
 @app.post("/api/public/shops/{slug}/feedback")
 def public_feedback(slug:str,data:FeedbackIn,payload=Depends(bearer_payload),db:Session=Depends(get_db)):
-    cid=require_customer(payload); customer=db.get(CustomerAccount,cid); shop=db.scalar(select(Shop).where(Shop.slug==slug,Shop.is_active==True))
-    if not customer or not shop: raise HTTPException(404,"Not found")
+    cid=require_customer(payload)
+    customer=db.get(CustomerAccount,cid)
+    shop=db.scalar(select(Shop).where(Shop.slug==slug,Shop.is_active==True))
+    if not customer or not shop:
+        raise HTTPException(404,"Not found")
+    order=None
     if data.order_id:
         order=db.scalar(select(Order).where(Order.id==data.order_id,Order.shop_id==shop.id,Order.customer_phone==customer.phone))
-        if not order: raise HTTPException(404,"Order not found")
-    x=Feedback(shop_id=shop.id,order_id=data.order_id,customer_phone=customer.phone,rating=data.rating,comment=data.comment); db.add(x); db.commit(); return {"ok":True}
+        if not order:
+            raise HTTPException(404,"Order not found")
+        if order.status != "delivered" and order.rider_status != "delivered":
+            raise HTTPException(400,"You can rate this shop after delivery")
+    existing = None
+    if data.order_id:
+        existing = db.scalar(
+            select(Feedback)
+            .where(
+                Feedback.shop_id == shop.id,
+                Feedback.order_id == data.order_id,
+                Feedback.customer_phone == customer.phone,
+            )
+            .order_by(Feedback.id.desc())
+        )
+    if existing:
+        existing.rating = data.rating
+        existing.comment = data.comment
+        x = existing
+    else:
+        x=Feedback(shop_id=shop.id,order_id=data.order_id,customer_phone=customer.phone,rating=data.rating,comment=data.comment)
+        db.add(x)
+    db.commit()
+    rating = shop_rating_summary(db, shop.id)
+    return {"ok":True,"rating":x.rating,**rating}
 
 
 @app.get("/api/shop-admin/activity-logs")

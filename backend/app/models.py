@@ -30,6 +30,8 @@ class Shop(Base):
     operating_status: Mapped[str] = mapped_column(String(20), default="open")
     service_fee_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     service_fee: Mapped[float] = mapped_column(Float, default=0)
+    service_fee_type: Mapped[str] = mapped_column(String(20), default="fixed")
+    service_fee_applies_to: Mapped[str] = mapped_column(String(20), default="delivery")
     small_order_fee_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     small_order_threshold: Mapped[float] = mapped_column(Float, default=20)
     small_order_fee: Mapped[float] = mapped_column(Float, default=0)

@@ -43,6 +43,13 @@ class ShopCreate(BaseModel):
     is_active: bool = True
     is_open: bool = True
     operating_status: str = "open"
+    service_fee_enabled: bool = False
+    service_fee: float = Field(default=0, ge=0)
+    service_fee_type: str = "fixed"
+    service_fee_applies_to: str = "delivery"
+    small_order_fee_enabled: bool = False
+    small_order_threshold: float = Field(default=20, ge=0)
+    small_order_fee: float = Field(default=0, ge=0)
 
 
 class ShopUpdate(BaseModel):
@@ -64,6 +71,13 @@ class ShopUpdate(BaseModel):
     is_active: bool | None = None
     is_open: bool | None = None
     operating_status: str | None = None
+    service_fee_enabled: bool | None = None
+    service_fee: float | None = Field(default=None, ge=0)
+    service_fee_type: str | None = None
+    service_fee_applies_to: str | None = None
+    small_order_fee_enabled: bool | None = None
+    small_order_threshold: float | None = Field(default=None, ge=0)
+    small_order_fee: float | None = Field(default=None, ge=0)
 
 
 class ShopSettingsIn(BaseModel):
@@ -82,6 +96,8 @@ class ShopSettingsIn(BaseModel):
     banner_url: str | None = None
     service_fee_enabled: bool | None = None
     service_fee: float | None = Field(default=None, ge=0)
+    service_fee_type: str | None = None
+    service_fee_applies_to: str | None = None
     small_order_fee_enabled: bool | None = None
     small_order_threshold: float | None = Field(default=None, ge=0)
     small_order_fee: float | None = Field(default=None, ge=0)
