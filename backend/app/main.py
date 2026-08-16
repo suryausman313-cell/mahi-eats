@@ -364,11 +364,14 @@ def _promo_discount(db: Session, shop: Shop, customer_phone: str, subtotal: floa
         )) or 0)
         if used >= int(offer.usage_limit_per_customer):
             raise HTTPException(400, "Promo usage limit reached")
-    if offer.discount_type == "fixed":
+    offer_type = str(offer.discount_type or "percentage").lower()
+    if offer_type == "free_delivery":
+        amount = 0.0
+    elif offer_type == "fixed":
         amount = float(offer.discount_value or 0)
     else:
         amount = subtotal * float(offer.discount_value or 0) / 100.0
-    if float(offer.maximum_discount or 0) > 0:
+    if float(offer.maximum_discount or 0) > 0 and offer_type != "free_delivery":
         amount = min(amount, float(offer.maximum_discount))
     return round(min(subtotal, max(0, amount)), 2), offer
 
@@ -656,7 +659,7 @@ def _shop_dashboard(db: Session, shop: Shop):
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "app": "Mahi Eats", "version": "9.0.0", "road_routing_ready": bool(GOOGLE_MAPS_API_KEY)}
+    return {"ok": True, "app": "Mahi Eats", "version": "13.0.0", "road_routing_ready": bool(GOOGLE_MAPS_API_KEY)}
 
 
 # ---------- AUTH ----------
@@ -817,10 +820,23 @@ def public_shops(
         }
         for shop_id, avg_rating, review_count in rating_rows
     }
+    shop_ids = [s.id for s in shops]
+    active_offers = db.scalars(
+        select(Offer).where(Offer.shop_id.in_(shop_ids), Offer.is_active == True).order_by(Offer.id.desc())
+    ).all() if shop_ids else []
+    offers_by_shop: dict[int, list[Offer]] = {}
+    for offer in active_offers:
+        offers_by_shop.setdefault(offer.shop_id, []).append(offer)
     rows = []
     for shop in shops:
         row = shop_json(shop)
         row.update(ratings.get(shop.id, {"rating_average": 0.0, "rating_count": 0}))
+        shop_offers = offers_by_shop.get(shop.id, [])
+        free_delivery_offers = [o for o in shop_offers if str(o.discount_type or "").lower() == "free_delivery"]
+        row["has_offers"] = bool(shop_offers)
+        row["offer_count"] = len(shop_offers)
+        row["has_free_delivery_offer"] = bool(free_delivery_offers)
+        row["featured_offer"] = offer_json(shop_offers[0]) if shop_offers else None
         if latitude is not None and longitude is not None and shop.latitude is not None and shop.longitude is not None:
             rule = delivery_rule_json(get_delivery_rule(db, shop), shop)
             direct = km_distance(shop.latitude, shop.longitude, latitude, longitude)
@@ -898,7 +914,11 @@ def public_promo(slug: str, data: PromoIn, payload=Depends(bearer_payload), db: 
     if not shop or not customer:
         raise HTTPException(404, "Shop or customer not found")
     discount, offer = _promo_discount(db, shop, customer.phone, float(data.subtotal or 0), data.promo_code)
-    return {"discount_amount": discount, "offer": offer_json(offer) if offer else None}
+    return {
+        "discount_amount": discount,
+        "free_delivery": bool(offer and str(offer.discount_type or "").lower() == "free_delivery"),
+        "offer": offer_json(offer) if offer else None,
+    }
 
 
 @app.post("/api/public/shops/{slug}/orders")
@@ -989,6 +1009,8 @@ def create_order(slug: str, data: OrderCreate, payload=Depends(bearer_payload), 
     delivery_fee = float(quote["delivery_fee"])
 
     discount_amount, promo = _promo_discount(db, shop, customer.phone, subtotal, data.promo_code)
+    if promo and str(promo.discount_type or "").lower() == "free_delivery":
+        delivery_fee = 0.0
     service_fee = service_fee_for(shop, subtotal, "delivery")
     small_order_fee = float(shop.small_order_fee or 0) if shop.small_order_fee_enabled and subtotal < float(shop.small_order_threshold or 0) else 0.0
     total = round(max(0, subtotal - discount_amount) + delivery_fee + service_fee + small_order_fee, 2)
@@ -1341,9 +1363,9 @@ def shop_settings(data: ShopSettingsIn, payload=Depends(bearer_payload), db: Ses
     sid = require_shop(payload)
     shop = db.get(Shop, sid)
     updates = data.model_dump(exclude_unset=True)
-    protected = {"delivery_mode", "delivery_fee", "latitude", "longitude"}
+    protected = {"delivery_mode", "delivery_fee", "latitude", "longitude", "commission_percent", "service_fee_enabled", "service_fee", "service_fee_type", "service_fee_applies_to", "small_order_fee_enabled", "small_order_threshold", "small_order_fee"}
     if protected.intersection(updates):
-        raise HTTPException(403, "Delivery mode, shop map location and delivery pricing are controlled by Mahi Eats Super Admin")
+        raise HTTPException(403, "Delivery pricing, commission, service fee and small-order fee are controlled by Mahi Eats Super Admin")
     status = updates.pop("operating_status", None)
     if status is not None:
         status = str(status).lower()
@@ -1524,7 +1546,11 @@ def admin_offers(payload=Depends(bearer_payload),db:Session=Depends(get_db)):
 
 @app.post("/api/shop-admin/offers")
 def admin_add_offer(data:OfferIn,payload=Depends(bearer_payload),db:Session=Depends(get_db)):
-    sid=require_shop(payload); raw=data.model_dump(); raw["promo_code"]=raw["promo_code"].strip().upper(); x=Offer(shop_id=sid,**raw); db.add(x)
+    sid=require_shop(payload); raw=data.model_dump(); raw["promo_code"]=raw["promo_code"].strip().upper()
+    if raw.get("discount_type") not in {"percentage", "fixed", "free_delivery"}: raise HTTPException(400,"Invalid offer type")
+    if raw.get("discount_type") != "free_delivery" and float(raw.get("discount_value") or 0) <= 0: raise HTTPException(400,"Discount value must be greater than zero")
+    if raw.get("discount_type") == "free_delivery": raw["discount_value"] = 0
+    x=Offer(shop_id=sid,**raw); db.add(x)
     try: activity(db,sid,payload,"Offer created",x.promo_code); db.commit(); db.refresh(x)
     except Exception: db.rollback(); raise HTTPException(409,"Promo code already exists for this shop")
     return offer_json(x)
@@ -1535,6 +1561,9 @@ def admin_edit_offer(offer_id:int,data:OfferIn,payload=Depends(bearer_payload),d
     sid=require_shop(payload); x=db.scalar(select(Offer).where(Offer.id==offer_id,Offer.shop_id==sid))
     if not x: raise HTTPException(404,"Offer not found")
     raw=data.model_dump(); raw["promo_code"]=raw["promo_code"].strip().upper()
+    if raw.get("discount_type") not in {"percentage", "fixed", "free_delivery"}: raise HTTPException(400,"Invalid offer type")
+    if raw.get("discount_type") != "free_delivery" and float(raw.get("discount_value") or 0) <= 0: raise HTTPException(400,"Discount value must be greater than zero")
+    if raw.get("discount_type") == "free_delivery": raw["discount_value"] = 0
     for k,v in raw.items(): setattr(x,k,v)
     activity(db,sid,payload,"Offer updated",x.promo_code); db.commit(); return offer_json(x)
 

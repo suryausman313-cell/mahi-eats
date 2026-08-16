@@ -235,7 +235,7 @@ class OfferIn(BaseModel):
     title: str = Field(min_length=1, max_length=180)
     promo_code: str = Field(min_length=1, max_length=60)
     discount_type: str = "percentage"
-    discount_value: float = Field(gt=0)
+    discount_value: float = Field(default=0, ge=0)
     minimum_order: float = Field(default=0, ge=0)
     maximum_discount: float = Field(default=0, ge=0)
     first_order_only: bool = False
