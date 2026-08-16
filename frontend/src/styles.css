@@ -111,3 +111,12 @@ html,body,#root{width:100%;max-width:100%;overflow-x:hidden}html{-webkit-text-si
 }
 .shopFeedbackCard{border-left:4px solid #f5b82e}.adminFeedbackStars{color:#f5b82e;font-size:19px;letter-spacing:2px}.shopFeedbackCard p{font-size:14px}.shopFeedbackCard small{font-size:11px}
 .customerBottomNav{z-index:45}.cartBar{z-index:50;bottom:92px}
+
+/* V13 working marketplace offers / platform finance */
+.promoCard{border:0;text-align:left;font:inherit;cursor:pointer;transition:transform .16s ease,box-shadow .16s ease,outline-color .16s ease;outline:3px solid transparent}
+.promoCard:hover{transform:translateY(-2px);box-shadow:0 14px 30px #00000013}.promoCard.selectedPromo{outline-color:#ffb28f;box-shadow:0 0 0 4px #ff5a1f18}
+.restaurantOffer{margin:9px 0 0;padding:8px 10px;border-radius:10px;background:#fff3ed;color:#b73a0d;display:flex;gap:7px;align-items:center;font-size:11px}.restaurantOffer svg{width:14px;height:14px;flex:0 0 auto}.restaurantOffer b{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.shopSectionTitleRow{display:flex;justify-content:space-between;gap:12px;align-items:end;margin-bottom:12px}.shopSectionTitleRow h2{margin-bottom:3px}.shopSectionTitleRow p{margin:0;color:#777;font-size:12px}
+.offerStrip>.shopOfferCard{min-width:210px;background:#fff0e9;border:1px solid #ffd1bd;border-radius:16px;padding:14px;display:grid;gap:6px;text-align:left;color:#171719;font:inherit;cursor:pointer}.shopOfferCard:hover{border-color:#ff8b5f;box-shadow:0 8px 20px #ff5a1f12}.shopOfferCard svg{color:#ff5a1f;width:20px}.shopOfferCard code{font-weight:900;font-size:14px}.shopOfferCard small{color:#74422f}.shopOfferCard>span{margin-top:4px;color:#ff5a1f;font-weight:900;font-size:12px}
+.superFinanceStats{grid-template-columns:repeat(auto-fit,minmax(120px,1fr))!important}.superFinanceStats .platformIncomeStat{background:#0d7d4d!important}.superFinanceStats .platformIncomeStat span,.superFinanceStats .platformIncomeStat b{color:#fff!important}
+@media(max-width:620px){.restaurantOffer{font-size:10px;padding:6px 7px}.offerStrip>.shopOfferCard{min-width:76vw}.superFinanceStats{grid-template-columns:repeat(2,minmax(0,1fr))!important}}
